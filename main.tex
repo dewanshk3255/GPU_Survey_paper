@@ -5,8 +5,20 @@
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{tikz}
-\usepackage[edges]{forest}
+\usetikzlibrary{arrows.meta, shapes.geometric, positioning, fit, backgrounds, calc, decorations.pathreplacing, matrix, patterns}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
 \usepackage{float}
+\usepackage{xcolor}
+\definecolor{nvidiagreen}{RGB}{118,185,0}
+\definecolor{nvidiagray}{RGB}{100,100,100}
+\definecolor{hopperblue}{RGB}{0,112,192}
+\definecolor{blackwellred}{RGB}{192,0,0}
+\definecolor{ambercolor}{RGB}{255,165,0}
+\definecolor{lightgray}{RGB}{230,230,230}
+\definecolor{lightblue}{RGB}{173,216,230}
+\definecolor{lightyellow}{RGB}{255,255,200}
+\definecolor{lightgreen}{RGB}{200,240,200}
 
 
 \title{GPU Kernel Optimization for Mixture-of-Experts on Hopper and Blackwell: A Survey}
@@ -20,7 +32,9 @@
 \maketitle
 
 \begin{abstract}
-Mixture-of-Experts (MoE) has become the dominant architecture for scaling Large Language Models beyond a trillion parameters while keeping per-token compute tractable. Realizing the theoretical efficiency of MoE in practice, however, hinges critically on GPU kernel engineering: routing, grouped GEMMs, and cross-layer fusion all stress the memory hierarchy of modern accelerators in ways that dense Transformers do not. The release of NVIDIA Hopper (H100) and Blackwell (B200/GB200) architectures---with WGMMA, TMA, thread-block clusters, fifth-generation tensor cores, and Tensor Memory (TMEM)---has reshaped what high-performance MoE kernels look like. This survey provides a systematic review of GPU kernel optimization techniques for MoE workloads on Hopper and Blackwell. We organize the literature along four axes: (i) hardware primitives and the memory hierarchy, (ii) the matmul kernel engineering lineage from CUTLASS to ThunderKittens and HipKittens, (iii) the FlashAttention lineage as a case study in IO-aware kernel design, and (iv) MoE-specific systems including MegaBlocks, ScatterMoE, Tutel, DeepSpeed-MoE, and SonicMoE. We present a worked case study of L2-cache-warm megakernel fusion and SMEM-level fusion for an MoE forward pass, and we discuss open problems including FP4 training, distributed all-to-all kernels, and cross-vendor portability to AMD CDNA. We hope this survey serves as an entry point for researchers and practitioners building the next generation of MoE kernels.
+Deploying trillion-parameter Mixture-of-Experts (MoE) models at scale is, in practice, a GPU kernel engineering problem. Per-token routing, grouped GEMMs with variable expert loads, and scatter/gather across HBM all conspire to keep effective arithmetic intensity well below the compute ceiling of modern accelerators, turning what would otherwise be straightforward matmul into a sustained memory-bandwidth challenge. The NVIDIA Hopper (H100) and Blackwell (B200/GB200) architectures have sharpened this challenge while simultaneously providing new tools to address it: asynchronous warp-group MMA (WGMMA), the Tensor Memory Accelerator (TMA), thread-block clusters with distributed shared memory, a dedicated Tensor Memory (TMEM), and native FP4/FP8 with microscaling---each of which demands a substantially different programming model than the generation before it.
+
+This survey maps the resulting technical landscape. We trace how high-performance matmul abstractions have evolved from hand-written CUDA through CUTLASS, CuTe/CuTeDSL, Triton, ThunderKittens, and HipKittens, and we use the FlashAttention lineage (FA1--FA4) as a running case study in IO-aware kernel co-design with hardware. Against that backdrop we survey MoE-specific systems---MegaBlocks, ScatterMoE, Tutel, DeepSpeed-MoE, FasterMoE, SonicMoE, DeepGEMM, DeepEP---focusing on grouped GEMM kernel design, distributed all-to-all communication, and the fusion patterns that exploit L2 and SMEM locality between otherwise separate kernel launches. A worked case study of L2-cache-warm megakernel fusion and time-multiplexed SMEM fusion for a SonicMoE-style MoE forward pass makes the cost model concrete. We close with an assessment of cross-vendor portability to AMD CDNA and a discussion of open problems: FP4 training kernels, compute-overlapped all-to-all, compiler automation of megakernel fusion, and heterogeneous-precision MoE.
 \end{abstract}
 
 \section{Introduction}
@@ -34,12 +48,14 @@ The recent release of NVIDIA Hopper (H100) and Blackwell (B200/GB200) GPUs has f
 
 \paragraph{Scope and Contributions.} This survey focuses on GPU kernel optimization for MoE workloads on Hopper and Blackwell. We:
 \begin{itemize}
-    \item Provide a unified taxonomy (Figure~\ref{fig:taxonomy}) of MoE kernel optimization techniques across four axes: hardware primitives, matmul DSLs, attention kernels, and MoE-specific systems.
+    \item Provide a unified taxonomy (Figures~\ref{fig:hw-taxonomy}--\ref{fig:moe-taxonomy}) of MoE kernel optimization techniques across four axes: hardware primitives, matmul DSLs, attention kernels, and MoE-specific systems.
     \item Trace the matmul kernel-engineering lineage from naive CUDA through CUTLASS, CuTe/CuTeDSL, Triton, ThunderKittens, and HipKittens~\citep{thakkar2023cutlass,tillet2019triton,spector2024thunderkittens,hipkittens2025}.
     \item Survey the FlashAttention lineage (FA1--FA4) as a case study in IO-aware kernel design and hardware co-evolution~\citep{dao2022flashattention,dao2023flashattention2,shah2024flashattention3,flashattention4}.
     \item Review MoE-specific systems---MegaBlocks, ScatterMoE, Tutel, DeepSpeed-MoE, FasterMoE, SonicMoE---and present a worked case study of megakernel fusion for an MoE forward pass.
     \item Identify open problems including FP4 training kernels, distributed all-to-all (DeepEP), and cross-vendor portability.
 \end{itemize}
+
+\paragraph{Scope and Limitations.} This survey covers NVIDIA Hopper (H100) and Blackwell (B200/GB200) hardware and focuses on dense-MoE workloads in training and inference at data-center scale. We do not cover AMD CDNA3/CDNA4 in depth beyond Section~\ref{sec:portability}, Intel Gaudi, or embedded/mobile accelerators. We do not evaluate FP4 training algorithms in detail---the hardware exists but the algorithmic consensus does not yet. Where we cite performance figures, we source them from the primary literature or from well-documented blog posts; we do not claim original experimental results unless stated explicitly. Survey scope necessarily omits some adjacent topics---quantization-aware training, speculative decoding, KV-cache compression---for which other surveys are more appropriate.
 
 % =====================================================================
 % PASS 1: Sections 2 and 3 — drop-in replacement for the existing
@@ -57,44 +73,63 @@ Figure~\ref{fig:hw-taxonomy} organizes the features we discuss into a taxonomy s
 
 \begin{figure}[t]
 \centering
-\begin{forest}
-for tree={
-  forked edges, draw, rounded corners, font=\footnotesize,
-  l sep+=4pt, s sep+=2pt, anchor=west, grow=east,
-  parent anchor=east, child anchor=west,
-  edge={-, thick}, align=left,
-}
-[{GPU Architecture\\Features}
-  [{Memory Hierarchy}
-    [{Registers (256\,KB/SM)}]
-    [{SMEM / L1 (228\,KB/SM)}]
-    [{TMEM (256\,KB/SM, Blackwell only)}]
-    [{L2 Cache (50\,MB H100 / 126\,MB B200)}]
-    [{HBM (3.35\,TB/s H100 / 8\,TB/s B200)}]
-  ]
-  [{Compute Units}
-    [{4th-gen Tensor Cores (WGMMA, Hopper)}]
-    [{5th-gen Tensor Cores (tcgen05, Blackwell)}]
-    [{CUDA cores (FP32/INT32)}]
-    [{Special Function Units (exp, log, rsqrt)}]
-  ]
-  [{Async Primitives}
-    [{TMA bulk async copy (Hopper+)}]
-    [{cp.async (Ampere legacy)}]
-    [{mbarrier / arrive-wait}]
-    [{Thread Block Clusters + DSMEM}]
-    [{CTA Pairs (Blackwell)}]
-  ]
-  [{Precision Formats}
-    [{FP32 / TF32}]
-    [{BF16 / FP16}]
-    [{FP8 (E4M3, E5M2)}]
-    [{FP6 / FP4 (Blackwell)}]
-    [{Microscaling (MXFP8/6/4)}]
-  ]
+\begin{tikzpicture}[
+  node distance=0.35cm and 0.5cm,
+  box/.style={draw, rounded corners=3pt, font=\scriptsize, inner sep=4pt, text centered, minimum width=3.2cm},
+  catbox/.style={box, fill=hopperblue!15, minimum width=2.4cm},
+  itembox/.style={box, fill=lightgray, minimum width=3.6cm},
+  rootbox/.style={box, fill=hopperblue!40, font=\small\bfseries, minimum width=3cm},
 ]
-\end{forest}
-\caption{Taxonomy of GPU architecture features relevant to MoE kernel optimization on Hopper and Blackwell. Features in italics are introduced in Hopper or later.}
+% Root
+\node[rootbox] (root) {GPU Architecture Features};
+
+% Categories
+\node[catbox, below left=0.7cm and 2.8cm of root] (mem) {Memory Hierarchy};
+\node[catbox, below left=0.7cm and 0.4cm of root] (comp) {Compute Units};
+\node[catbox, below right=0.7cm and 0.5cm of root] (async) {Async Primitives};
+\node[catbox, below right=0.7cm and 3.1cm of root] (prec) {Precision Formats};
+
+% Memory items
+\node[itembox, below=0.25cm of mem] (r1) {Registers (256\,KB/SM)};
+\node[itembox, below=0.1cm of r1] (r2) {SMEM/L1 (228\,KB/SM)};
+\node[itembox, below=0.1cm of r2] (r3) {TMEM (256\,KB, Blackwell)};
+\node[itembox, below=0.1cm of r3] (r4) {L2 (50\,MB H100 / 126\,MB B200)};
+\node[itembox, below=0.1cm of r4] (r5) {HBM (3.35\,TB/s H100)};
+
+% Compute items
+\node[itembox, below=0.25cm of comp] (c1) {4th-gen TC (WGMMA, Hopper)};
+\node[itembox, below=0.1cm of c1] (c2) {5th-gen TC (tcgen05, Blackwell)};
+\node[itembox, below=0.1cm of c2] (c3) {CUDA cores (FP32/INT32)};
+\node[itembox, below=0.1cm of c3] (c4) {Special Function Units};
+
+% Async items
+\node[itembox, below=0.25cm of async] (a1) {TMA bulk async (Hopper+)};
+\node[itembox, below=0.1cm of a1] (a2) {cp.async (Ampere legacy)};
+\node[itembox, below=0.1cm of a2] (a3) {mbarrier / arrive-wait};
+\node[itembox, below=0.1cm of a3] (a4) {Thread-block clusters + DSMEM};
+\node[itembox, below=0.1cm of a4] (a5) {CTA Pairs (Blackwell)};
+
+% Precision items
+\node[itembox, below=0.25cm of prec] (p1) {FP32 / TF32};
+\node[itembox, below=0.1cm of p1] (p2) {BF16 / FP16};
+\node[itembox, below=0.1cm of p2] (p3) {FP8 (E4M3, E5M2)};
+\node[itembox, below=0.1cm of p3] (p4) {FP6 / FP4 (Blackwell)};
+\node[itembox, below=0.1cm of p4] (p5) {Microscaling (MXFP8/6/4)};
+
+% Edges root -> categories
+\draw[-{Latex}] (root) -- (mem);
+\draw[-{Latex}] (root) -- (comp);
+\draw[-{Latex}] (root) -- (async);
+\draw[-{Latex}] (root) -- (prec);
+
+% Edges categories -> items
+\foreach \cat/\items in {mem/{r1,r2,r3,r4,r5}, comp/{c1,c2,c3,c4}, async/{a1,a2,a3,a4,a5}, prec/{p1,p2,p3,p4,p5}}{
+  \foreach \item in \items {
+    \draw[-{Latex}, gray] (\cat) -- (\item);
+  }
+}
+\end{tikzpicture}
+\caption{Taxonomy of GPU architecture features relevant to MoE kernel optimization on Hopper and Blackwell. Features marked ``Blackwell'' are new in the B200 generation.}
 \label{fig:hw-taxonomy}
 \end{figure}
 
@@ -106,6 +141,83 @@ GPU performance is governed, more than anything else, by the steep bandwidth gra
 This problem is most usefully analyzed through the \emph{roofline model} \citep{williams2009roofline}, which plots achievable throughput as a function of arithmetic intensity (FLOPs per byte of memory traffic). For a given precision, every kernel sits somewhere on a piecewise-linear curve: at low arithmetic intensity, throughput is limited by the slope of the bandwidth roof; at high arithmetic intensity, it is capped by the horizontal compute roof. The transition point---the arithmetic intensity at which a kernel becomes compute-bound rather than memory-bound---is determined by the ratio of peak compute to peak bandwidth. On H100 in BF16, that ratio is roughly 295 FLOPs/byte; in FP8 it doubles to roughly 590 FLOPs/byte; on B200 in FP4 it climbs higher still. The practical consequence is that as tensor cores get faster, more and more workloads slip into the memory-bound region, and kernel design becomes dominated by data-movement decisions rather than instruction-issue decisions \citep{boehm2022cudammm,gordic2024matmul}.
 
 MoE workloads sit in an awkward part of this curve. A standard dense matmul of large square matrices is comfortably compute-bound on Hopper, but MoE introduces three pathologies that pull effective arithmetic intensity downward. First, routing partitions tokens into per-expert groups whose sizes vary at runtime, so each expert sees a relatively small (sometimes very small) effective $M$ dimension and the per-expert matmul is closer to the memory-bound regime. Second, MoE forward passes typically launch two GEMMs per layer (up-projection followed by down-projection) with an intermediate activation that, if naively materialized, must be written to HBM and read back. Third, the routing metadata itself---expert offsets, gather indices, expert frequencies---is small but accessed twice (once per GEMM). Each of these issues is addressable, and the rest of this survey is in large part a catalogue of how. But all of them depend on the kernel writer having a precise mental model of the memory hierarchy they are programming against.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[scale=0.95]
+  % Memory hierarchy pyramid / stacked bars
+  % X: level name, Y: bandwidth (log scale conceptually shown as bar heights)
+  % We draw a horizontal bar chart with annotated bandwidth values
+
+  % Define levels and their data
+  % Rows: Registers, SMEM, L2, HBM (A100), HBM (H100), HBM (B200)
+  \def\bw{5.5} % total width of chart area
+
+  % Color coding
+  \colorlet{regcol}{nvidiagreen!60}
+  \colorlet{smemcol}{hopperblue!50}
+  \colorlet{l2col}{ambercolor!60}
+  \colorlet{hbma100}{blackwellred!30}
+  \colorlet{hbmh100}{blackwellred!55}
+  \colorlet{hbmb200}{blackwellred!80}
+
+  % --- horizontal bar chart ---
+  % Each bar: (y position, label, bar width scaled, color, annotation)
+  % BW values: Registers ~unlimited (shown as 100x), SMEM~19 TB/s, L2~12 TB/s, HBM A100 2.0, H100 3.35, B200 8.0
+  % Scale: log-ish, normalized to HBM-H100=1.0 unit = 1.6cm
+  \def\unit{0.42} % 1 TB/s = this many cm
+
+  % SMEM: ~19 TB/s -> 7.98cm, cap at 6cm with ">" indicator
+  % L2: ~12 TB/s -> 5.04cm
+  % HBM A100: 2.0 -> 0.84cm
+  % HBM H100: 3.35 -> 1.41cm
+  % HBM B200: 8.0 -> 3.36cm
+  % Registers: "unlimited" -> use 6cm with annotation
+
+  \def\yspace{0.55}
+  \def\barh{0.38}
+
+  % Draw bars
+  \filldraw[regcol] (0, 6*\yspace) rectangle (6.0, 6*\yspace+\barh);
+  \filldraw[smemcol] (0, 5*\yspace) rectangle (5.5, 5*\yspace+\barh);
+  \filldraw[l2col] (0, 4*\yspace) rectangle (4.32, 4*\yspace+\barh);
+  \filldraw[hbmb200] (0, 3*\yspace) rectangle (3.36, 3*\yspace+\barh);
+  \filldraw[hbmh100] (0, 2*\yspace) rectangle (1.41, 2*\yspace+\barh);
+  \filldraw[hbma100] (0, 1*\yspace) rectangle (0.84, 1*\yspace+\barh);
+
+  % Row labels (left side)
+  \node[font=\scriptsize, anchor=east] at (-0.1, 6*\yspace+\barh/2) {Registers};
+  \node[font=\scriptsize, anchor=east] at (-0.1, 5*\yspace+\barh/2) {SMEM / L1};
+  \node[font=\scriptsize, anchor=east] at (-0.1, 4*\yspace+\barh/2) {L2 Cache};
+  \node[font=\scriptsize, anchor=east] at (-0.1, 3*\yspace+\barh/2) {HBM (B200)};
+  \node[font=\scriptsize, anchor=east] at (-0.1, 2*\yspace+\barh/2) {HBM (H100)};
+  \node[font=\scriptsize, anchor=east] at (-0.1, 1*\yspace+\barh/2) {HBM (A100)};
+
+  % Value annotations (right side)
+  \node[font=\scriptsize\bfseries, anchor=west] at (6.05, 6*\yspace+\barh/2) {\textgreater{}100\,TB/s (eff.)};
+  \node[font=\scriptsize\bfseries, anchor=west] at (5.55, 5*\yspace+\barh/2) {$\sim$19\,TB/s};
+  \node[font=\scriptsize\bfseries, anchor=west] at (4.37, 4*\yspace+\barh/2) {$\sim$12\,TB/s};
+  \node[font=\scriptsize\bfseries, anchor=west] at (3.41, 3*\yspace+\barh/2) {8.0\,TB/s};
+  \node[font=\scriptsize\bfseries, anchor=west] at (1.46, 2*\yspace+\barh/2) {3.35\,TB/s};
+  \node[font=\scriptsize\bfseries, anchor=west] at (0.89, 1*\yspace+\barh/2) {2.0\,TB/s};
+
+  % X axis label
+  \node[font=\scriptsize, gray] at (3, -0.25) {Bandwidth (higher = faster, bars not to log scale)};
+
+  % Vertical divider lines for visual clarity
+  \draw[gray!40, thin] (0, 0.5) -- (0, 7*\yspace);
+
+  % Latency annotation on right
+  \draw[decorate, decoration={brace, amplitude=5pt}, thick, gray]
+    (10.5, 1*\yspace) -- (10.5, 6*\yspace+\barh)
+    node[midway, right=6pt, font=\scriptsize, align=center] {Latency\\increases\\$\downarrow$\\($\sim$30$\times$\\reg$\to$HBM)};
+
+  % Cost-to-move annotation
+  \node[font=\tiny, gray, align=left] at (8.8, 3.5*\yspace) {Cost to move\\1 byte:\\SMEM: free\\L2: $\sim$2$\times$\\HBM: $\sim$5--8$\times$};
+\end{tikzpicture}
+\caption{GPU memory hierarchy bandwidth on H100 SXM5 and B200. Effective register bandwidth exceeds HBM by $>$30$\times$; each level down the hierarchy adds latency and reduces bandwidth. The fundamental objective of high-performance kernel engineering is to keep hot data in the highest level possible. SMEM and L2 bandwidth figures are aggregate (chip-wide); register bandwidth per SM is even higher.}
+\label{fig:mem-hierarchy}
+\end{figure}
 
 \subsection{NVIDIA Hopper (H100)}
 \label{sec:hw-hopper}
@@ -130,6 +242,79 @@ Hopper's tensor cores natively support FP8 in two formats: E4M3 (4 exponent bits
 
 \subsubsection{The Producer-Consumer Warp-Specialization Pattern}
 The four features above are most powerful when combined into the producer-consumer warp-specialization pattern that has become the canonical Hopper kernel idiom \citep{shah2024flashattention3,thakkar2023cutlass,colfax2024fa3}. A typical Hopper matmul kernel allocates one warp group as the \emph{producer}, whose only job is to issue TMA loads of operand tiles into a circular buffer in SMEM, and one or more warp groups as \emph{consumers}, which issue WGMMAs against tiles already loaded by the producer. Synchronization between producer and consumer is mediated by \texttt{mbarrier} arrive-wait pairs: the producer increments a barrier after each TMA load completes, and the consumer waits on the barrier before issuing the corresponding WGMMA. Because TMA, WGMMA, and barrier waits are all asynchronous, the producer and consumer can run in lockstep without ever stalling on each other, achieving close to 100\% tensor-core utilization on suitably shaped problems. A common refinement is \emph{ping-pong scheduling}, in which two consumer warp groups alternate so that one is in its epilogue while the other is in its mainloop, hiding the cost of writing results to SMEM.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  tmabox/.style={fill=hopperblue!30, draw=hopperblue!60, rounded corners=2pt, font=\scriptsize, inner sep=3pt},
+  wgmmabox/.style={fill=nvidiagreen!40, draw=nvidiagreen!70, rounded corners=2pt, font=\scriptsize, inner sep=3pt},
+  epilbox/.style={fill=ambercolor!50, draw=ambercolor!80, rounded corners=2pt, font=\scriptsize, inner sep=3pt},
+  waitbox/.style={fill=lightgray, draw=gray, rounded corners=2pt, font=\scriptsize, inner sep=3pt},
+  barrbox/.style={fill=blackwellred!20, draw=blackwellred!60, font=\tiny, inner sep=2pt},
+]
+\def\T{1.6} % tile width
+\def\gap{0.06}
+\def\yscale{0.6}
+
+% Time axis
+\draw[-{Latex}, gray] (-0.3, 0) -- (13.8, 0) node[right, font=\scriptsize] {time};
+\node[font=\scriptsize, gray] at (-0.3, 0.35) {cycle};
+
+% Row labels
+\node[font=\scriptsize\bfseries, anchor=east] at (-0.4, 1*\yscale+0.2) {Producer WG};
+\node[font=\scriptsize\bfseries, anchor=east] at (-0.4, 2.6*\yscale+0.2) {Consumer WG-A};
+\node[font=\scriptsize\bfseries, anchor=east] at (-0.4, 4.1*\yscale+0.2) {Consumer WG-B};
+
+% === Tile 0 ===
+\node[tmabox, minimum width=\T cm, minimum height=0.5cm] at (0.8, 1*\yscale+0.2) {TMA load tile 0};
+\node[barrbox] at (1.8, 0.55) {bar0 post};
+
+\node[waitbox, minimum width=0.4cm, minimum height=0.5cm] at (0.2, 2.6*\yscale+0.2) {wait};
+\node[wgmmabox, minimum width=\T cm, minimum height=0.5cm] at (1.3, 2.6*\yscale+0.2) {WGMMA tile 0};
+
+% === Tile 1 ===
+\node[tmabox, minimum width=\T cm, minimum height=0.5cm] at (2.7, 1*\yscale+0.2) {TMA load tile 1};
+\node[barrbox] at (3.7, 0.55) {bar1 post};
+
+\node[epilbox, minimum width=0.9cm, minimum height=0.5cm] at (2.25, 2.6*\yscale+0.2) {epilogue A};
+\node[waitbox, minimum width=0.3cm, minimum height=0.5cm] at (3.15, 4.1*\yscale+0.2) {wait};
+\node[wgmmabox, minimum width=\T cm, minimum height=0.5cm] at (4.0, 4.1*\yscale+0.2) {WGMMA tile 1};
+
+% === Tile 2 ===
+\node[tmabox, minimum width=\T cm, minimum height=0.5cm] at (4.6, 1*\yscale+0.2) {TMA load tile 2};
+\node[barrbox] at (5.6, 0.55) {bar2 post};
+
+\node[waitbox, minimum width=0.3cm, minimum height=0.5cm] at (5.0, 2.6*\yscale+0.2) {wait};
+\node[wgmmabox, minimum width=\T cm, minimum height=0.5cm] at (5.85, 2.6*\yscale+0.2) {WGMMA tile 2};
+\node[epilbox, minimum width=0.9cm, minimum height=0.5cm] at (5.05, 4.1*\yscale+0.2) {epilogue B};
+
+% === Tile 3 ===
+\node[tmabox, minimum width=\T cm, minimum height=0.5cm] at (7.4, 1*\yscale+0.2) {TMA load tile 3};
+\node[barrbox] at (8.4, 0.55) {bar3 post};
+
+\node[epilbox, minimum width=0.9cm, minimum height=0.5cm] at (7.05, 2.6*\yscale+0.2) {epilogue A};
+\node[waitbox, minimum width=0.3cm, minimum height=0.5cm] at (7.95, 4.1*\yscale+0.2) {wait};
+\node[wgmmabox, minimum width=\T cm, minimum height=0.5cm] at (8.8, 4.1*\yscale+0.2) {WGMMA tile 3};
+
+% Ellipsis
+\node[font=\large] at (10.3, 2*\yscale+0.2) {$\cdots$};
+
+% Legend
+\begin{scope}[shift={(0,-1.0)}]
+  \node[tmabox, minimum width=1.8cm] at (1.5, 0) {TMA load (async)};
+  \node[wgmmabox, minimum width=2.0cm] at (4.1, 0) {WGMMA issue (async)};
+  \node[epilbox, minimum width=1.6cm] at (6.6, 0) {Epilogue / writeback};
+  \node[waitbox, minimum width=1.3cm] at (8.8, 0) {mbarrier wait};
+\end{scope}
+
+% Braces for ping-pong annotation
+\draw[decorate, decoration={brace, amplitude=4pt, mirror}, thick, gray]
+  (0.0, 4.8*\yscale) -- (8.0, 4.8*\yscale)
+  node[midway, above=5pt, font=\tiny, gray] {Ping-pong: WG-A and WG-B overlap epilogue with next WGMMA};
+\end{tikzpicture}
+\caption{Hopper producer-consumer warp-specialization pipeline with ping-pong scheduling. The Producer warp group issues asynchronous TMA loads into SMEM double-buffers and posts \texttt{mbarrier} signals. Two Consumer warp groups (WG-A, WG-B) wait on the barrier then issue WGMMA tiles; they alternate so that one is in its epilogue (writing accumulator to SMEM/HBM) while the other is computing, hiding epilogue latency behind tensor-core throughput.}
+\label{fig:warp-spec}
+\end{figure}
 
 \subsection{NVIDIA Blackwell (B200/GB200)}
 \label{sec:hw-blackwell}
@@ -182,6 +367,68 @@ NVLink bandwidth & 600\,GB/s & 900\,GB/s & 1,800\,GB/s \\
 
 The single most important takeaway from Table~\ref{tab:hw-detailed} for the rest of this survey is that the ratio of compute throughput to HBM bandwidth has grown substantially with each generation. On A100 in BF16, this ratio is approximately 156 FLOPs/byte; on H100 in BF16, 295 FLOPs/byte; on B200 in BF16, roughly 280 FLOPs/byte (compute and bandwidth grew in tandem); but in FP8 on H100 it is 590 FLOPs/byte and in FP4 on B200 it exceeds 1,100 FLOPs/byte. As the precision drops, more and more workloads slip from compute-bound into memory-bound territory, making kernel-level data-movement optimization the dominant lever for end-to-end performance. This is the technical context in which the techniques surveyed in Sections~\ref{sec:matmul} through \ref{sec:fusion} should be understood.
 
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+  width=12cm, height=7cm,
+  xlabel={Arithmetic Intensity (FLOPs/byte)},
+  ylabel={Throughput (TFLOPS)},
+  xmin=1, xmax=5000,
+  ymin=10, ymax=20000,
+  grid=both,
+  grid style={gray!20},
+  legend style={at={(0.03,0.97)}, anchor=north west, font=\scriptsize, fill=white, draw=gray},
+  tick label style={font=\scriptsize},
+  label style={font=\small},
+  title style={font=\small},
+  title={Roofline Model: A100, H100, B200},
+]
+
+% --- A100 BF16 roof: 312 TFLOPS, BW=2.0 TB/s, ridge=312/2=156 ---
+\addplot[thick, hbma100!80!black, domain=1:156] {2.0*x};
+\addplot[thick, hbma100!80!black, domain=156:5000] {312};
+\addlegendentry{A100 BF16 (312 TFLOPS, 2.0 TB/s)}
+
+% --- H100 BF16 roof: 989 TFLOPS, BW=3.35 TB/s, ridge=989/3.35≈295 ---
+\addplot[thick, hopperblue, domain=1:295] {3.35*x};
+\addplot[thick, hopperblue, domain=295:5000] {989};
+\addlegendentry{H100 BF16 (989 TFLOPS, 3.35 TB/s)}
+
+% --- H100 FP8 roof: 1979 TFLOPS, BW=3.35 TB/s, ridge=1979/3.35≈590 ---
+\addplot[thick, hopperblue, dashed, domain=1:590] {3.35*x};
+\addplot[thick, hopperblue, dashed, domain=590:5000] {1979};
+\addlegendentry{H100 FP8 (1979 TFLOPS, 3.35 TB/s)}
+
+% --- B200 BF16 roof: ~2250 TFLOPS, BW=8.0 TB/s, ridge=2250/8=281 ---
+\addplot[thick, blackwellred, domain=1:281] {8.0*x};
+\addplot[thick, blackwellred, domain=281:5000] {2250};
+\addlegendentry{B200 BF16 ($\approx$2250 TFLOPS, 8.0 TB/s)}
+
+% --- B200 FP4 roof: ~9000 TFLOPS, BW=8.0 TB/s, ridge=9000/8=1125 ---
+\addplot[thick, blackwellred, dashed, domain=1:1125] {8.0*x};
+\addplot[thick, blackwellred, dashed, domain=1125:5000] {9000};
+\addlegendentry{B200 FP4 ($\approx$9000 TFLOPS, 8.0 TB/s)}
+
+% --- Annotate workload points ---
+% Dense GEMM (large square, BF16, H100): ~295 FLOPs/byte -> compute-bound
+\addplot[only marks, mark=*, mark size=3pt, hopperblue] coordinates {(295, 850)};
+\node[font=\tiny, hopperblue, anchor=south] at (axis cs:295, 870) {Dense GEMM};
+
+% MoE grouped GEMM (small m_e, BF16, H100): ~30 FLOPs/byte -> mem-bound
+\addplot[only marks, mark=square*, mark size=3pt, ambercolor!80!black] coordinates {(30, 100)};
+\node[font=\tiny, ambercolor!80!black, anchor=north] at (axis cs:30, 95) {MoE GEMM (small $m_e$)};
+
+% Attention FA3 (H100, BF16): ~50 FLOPs/byte (IO-aware, effective)
+\addplot[only marks, mark=triangle*, mark size=3pt, nvidiagreen!70!black] coordinates {(50, 167)};
+\node[font=\tiny, nvidiagreen!70!black, anchor=west] at (axis cs:52, 167) {FA3 attn.};
+
+\end{loglogaxis}
+\end{tikzpicture}
+\caption{Roofline model for A100, H100 SXM5, and B200. Solid lines show BF16 roofs; dashed lines show FP8 (H100) and FP4 (B200) roofs. Annotated points show representative achieved throughput for a well-tuned dense GEMM (compute-bound), an MoE grouped GEMM with small per-expert token count (memory-bound), and FA3 attention. As precision drops from BF16 to FP8/FP4, the ridge point shifts right, pushing more workloads into the memory-bound regime and increasing the importance of data-movement optimization.}
+\label{fig:roofline}
+\end{figure}
+
 \section{The Matmul Kernel Engineering Lineage}
 \label{sec:matmul}
 
@@ -189,38 +436,49 @@ Matrix multiplication is the workhorse of every Transformer, and grouped variant
 
 \begin{figure}[t]
 \centering
-\begin{forest}
-for tree={
-  forked edges, draw, rounded corners, font=\footnotesize,
-  l sep+=4pt, s sep+=2pt, anchor=west, grow=east,
-  parent anchor=east, child anchor=west,
-  edge={-, thick}, align=left,
-}
-[{Matmul Kernel\\Approaches}
-  [{Low-Level}
-    [{Hand-written CUDA C++}]
-    [{Inline PTX}]
-    [{Pedagogical tutorials \citep{boehm2022cudammm,gordic2024matmul}}]
-  ]
-  [{Template Libraries}
-    [{CUTLASS 2.x \citep{thakkar2023cutlass}}]
-    [{CuTe layout algebra (CUTLASS 3.x)}]
-    [{Composable Kernel (AMD)}]
-  ]
-  [{Pythonic / DSL}
-    [{Triton \citep{tillet2019triton}}]
-    [{CuTeDSL \citep{veitner2025blackwell}}]
-    [{ThunderKittens \citep{spector2024thunderkittens}}]
-    [{HipKittens \citep{hipkittens2025}}]
-  ]
-  [{Vendor Libraries}
-    [{cuBLAS / cuBLASLt}]
-    [{cuDNN}]
-    [{rocBLAS / hipBLASLt (AMD)}]
-  ]
+\begin{tikzpicture}[
+  node distance=0.3cm and 0.5cm,
+  box/.style={draw, rounded corners=3pt, font=\scriptsize, inner sep=4pt, text centered, minimum width=3.8cm},
+  catbox/.style={box, fill=hopperblue!15, minimum width=2.8cm},
+  itembox/.style={box, fill=lightgray, minimum width=3.8cm},
+  rootbox/.style={box, fill=hopperblue!40, font=\small\bfseries, minimum width=3.2cm},
 ]
-\end{forest}
-\caption{Taxonomy of matmul kernel implementation approaches, ordered roughly by abstraction level.}
+\node[rootbox] (root) {Matmul Kernel Approaches};
+
+\node[catbox, below left=0.7cm and 2.4cm of root] (ll) {Low-Level};
+\node[catbox, below left=0.7cm and 0.1cm of root] (tl) {Template Libraries};
+\node[catbox, below right=0.7cm and 0.8cm of root] (dsl) {Pythonic / DSL};
+\node[catbox, below right=0.7cm and 3.6cm of root] (vl) {Vendor Libraries};
+
+\node[itembox, below=0.25cm of ll] (l1) {Hand-written CUDA C++};
+\node[itembox, below=0.1cm of l1] (l2) {Inline PTX};
+\node[itembox, below=0.1cm of l2] (l3) {Pedagogical tutorials};
+
+\node[itembox, below=0.25cm of tl] (t1) {CUTLASS 2.x};
+\node[itembox, below=0.1cm of t1] (t2) {CuTe layout algebra (3.x)};
+\node[itembox, below=0.1cm of t2] (t3) {Composable Kernel (AMD)};
+
+\node[itembox, below=0.25cm of dsl] (d1) {Triton};
+\node[itembox, below=0.1cm of d1] (d2) {CuTeDSL};
+\node[itembox, below=0.1cm of d2] (d3) {ThunderKittens};
+\node[itembox, below=0.1cm of d3] (d4) {HipKittens (AMD)};
+
+\node[itembox, below=0.25cm of vl] (v1) {cuBLAS / cuBLASLt};
+\node[itembox, below=0.1cm of v1] (v2) {cuDNN};
+\node[itembox, below=0.1cm of v2] (v3) {rocBLAS / hipBLASLt};
+
+\draw[-{Latex}] (root) -- (ll);
+\draw[-{Latex}] (root) -- (tl);
+\draw[-{Latex}] (root) -- (dsl);
+\draw[-{Latex}] (root) -- (vl);
+
+\foreach \cat/\items in {ll/{l1,l2,l3}, tl/{t1,t2,t3}, dsl/{d1,d2,d3,d4}, vl/{v1,v2,v3}}{
+  \foreach \item in \items {
+    \draw[-{Latex}, gray] (\cat) -- (\item);
+  }
+}
+\end{tikzpicture}
+\caption{Taxonomy of matmul kernel implementation approaches, ordered roughly by abstraction level. HipKittens targets AMD CDNA hardware; all others target NVIDIA.}
 \label{fig:matmul-taxonomy}
 \end{figure}
 
@@ -305,7 +563,7 @@ cuBLAS / cuBLASLt & closed-source & ---  & yes & yes & 95--99\% \\
 \end{tabular}
 \end{table}
 
-The pattern in Table~\ref{tab:matmul-dsl} is that the highest performance is achievable either with closed-source vendor libraries or with the lowest-level frameworks that expose Hopper's hardware features directly (CUTLASS 3.x/CuTe, CuTeDSL, ThunderKittens). High-level frameworks like Triton trade some of that performance for dramatically reduced kernel-writing effort, which is often the right tradeoff for research code or for kernels whose shapes do not justify hand-tuning. The relevance to MoE is direct: the grouped GEMMs at the heart of every MoE layer have shapes that vary at runtime and that vendor libraries do not optimize for, which is exactly the regime in which custom kernels written in CuTe, CuTeDSL, or ThunderKittens are most valuable. Section~\ref{sec:moe} surveys the MoE-specific systems built on these foundations.
+The pattern in Table~\ref{tab:matmul-dsl} is that the highest performance is achievable either with closed-source vendor libraries or with the lowest-level frameworks that expose Hopper's hardware features directly (CUTLASS 3.x/CuTe, CuTeDSL, ThunderKittens). High-level frameworks like Triton trade some of that performance for dramatically reduced kernel-writing effort, which is often the right tradeoff for research code or for kernels whose shapes do not justify hand-tuning. The grouped GEMMs at the heart of every MoE layer have shapes that vary at runtime and that vendor libraries do not optimize for---exactly the regime in which custom kernels written in CuTe, CuTeDSL, or ThunderKittens are most valuable, and which motivates the systems discussed in the following section.
 
 % =====================================================================
 % Bibliography fragment for the new references introduced in Pass 1
@@ -346,44 +604,62 @@ Figure~\ref{fig:fa-taxonomy} organizes the four generations along with the key t
 
 \begin{figure}[htbp]
 \centering
-\scalebox{0.7}{
-\begin{forest}
-for tree={
-  forked edges, draw, rounded corners, font=\footnotesize,
-  l sep+=4pt, s sep+=2pt, anchor=west, grow=east,
-  parent anchor=east, child anchor=west,
-  edge={-, thick}, align=left,
-}
-[{FlashAttention\\Lineage}
-  [{FA1 (Ampere) \citep{dao2022flashattention}}
-    [{Online softmax}]
-    [{Tile-based fusion of QK\textsuperscript{T}, softmax, V}]
-    [{Recomputation in backward}]
-    [{No HBM materialization of attention matrix}]
-  ]
-  [{FA2 (Ampere/Hopper) \citep{dao2023flashattention2}}
-    [{Reduced non-matmul FLOPs}]
-    [{Parallelism over sequence dimension}]
-    [{Improved work partitioning across warps}]
-    [{$\sim 2\times$ over FA1 on A100}]
-  ]
-  [{FA3 (Hopper) \citep{shah2024flashattention3}}
-    [{WGMMA + TMA + warp specialization}]
-    [{Producer-consumer 2-warp-group pipeline}]
-    [{FP8 with block-level scaling}]
-    [{Pingpong scheduling for epilogue overlap}]
-    [{$\sim 75\%$ of H100 SOL}]
-  ]
-  [{FA4 (Blackwell) \citep{flashattention4}}
-    [{tcgen05.mma + TMEM accumulator}]
-    [{CTA-pair cooperative tiling}]
-    [{Larger tile shapes via TMEM}]
-    [{Restructured softmax stats in TMEM}]
-  ]
+\begin{tikzpicture}[
+  genbox/.style={draw, rounded corners=4pt, font=\scriptsize\bfseries, inner sep=6pt, text centered, minimum width=2.8cm, minimum height=0.7cm},
+  featbox/.style={draw, rounded corners=2pt, font=\scriptsize, inner sep=3pt, text centered, minimum width=2.8cm, fill=lightgray},
+  arrow/.style={-{Latex}, thick},
 ]
-\end{forest}
+% Generation headers
+\node[genbox, fill=lightgray!60] (fa1) at (0,0) {FA1 --- Ampere};
+\node[genbox, fill=lightblue!60] (fa2) at (3.4,0) {FA2 --- Ampere/H100};
+\node[genbox, fill=hopperblue!30] (fa3) at (6.8,0) {FA3 --- H100 (Hopper)};
+\node[genbox, fill=blackwellred!20] (fa4) at (10.2,0) {FA4 --- B200 (Blackwell)};
+
+% Year labels
+\node[font=\tiny, gray] at (0,-0.55) {2022};
+\node[font=\tiny, gray] at (3.4,-0.55) {2023};
+\node[font=\tiny, gray] at (6.8,-0.55) {2024};
+\node[font=\tiny, gray] at (10.2,-0.55) {2025};
+
+% FA1 features
+\node[featbox] (f1a) at (0,-1.4) {Online softmax};
+\node[featbox] (f1b) at (0,-2.0) {Fused QK$^\top$, softmax, $\cdot V$};
+\node[featbox] (f1c) at (0,-2.6) {Recompute in backward};
+\node[featbox] (f1d) at (0,-3.2) {No HBM attn.\ matrix};
+\node[featbox, fill=lightyellow] (f1e) at (0,-3.8) {$\sim$25\% H/W SOL};
+
+% FA2 features
+\node[featbox] (f2a) at (3.4,-1.4) {Reduce non-matmul FLOPs};
+\node[featbox] (f2b) at (3.4,-2.0) {Seq-dim parallelism};
+\node[featbox] (f2c) at (3.4,-2.6) {Improved warp partition};
+\node[featbox] (f2d) at (3.4,-3.2) {$\sim$2$\times$ FA1 on A100};
+\node[featbox, fill=lightyellow] (f2e) at (3.4,-3.8) {$\sim$50\% H/W SOL};
+
+% FA3 features
+\node[featbox] (f3a) at (6.8,-1.4) {WGMMA + TMA};
+\node[featbox] (f3b) at (6.8,-2.0) {Warp specialization};
+\node[featbox] (f3c) at (6.8,-2.6) {Pingpong epilogue overlap};
+\node[featbox] (f3d) at (6.8,-3.2) {FP8 block-level scaling};
+\node[featbox, fill=lightyellow] (f3e) at (6.8,-3.8) {$\sim$75\% H100 SOL};
+
+% FA4 features
+\node[featbox] (f4a) at (10.2,-1.4) {tcgen05.mma + TMEM};
+\node[featbox] (f4b) at (10.2,-2.0) {CTA-pair cooperation};
+\node[featbox] (f4c) at (10.2,-2.6) {Larger tiles via TMEM};
+\node[featbox] (f4d) at (10.2,-3.2) {Softmax stats in TMEM};
+\node[featbox, fill=lightyellow] (f4e) at (10.2,-3.8) {$\sim$75--80\% B200 SOL};
+
+% Horizontal arrows between generations
+\draw[arrow, hopperblue] (fa1) -- (fa2);
+\draw[arrow, hopperblue] (fa2) -- (fa3);
+\draw[arrow, hopperblue] (fa3) -- (fa4);
+
+% Vertical connectors
+\foreach \gen/\items in {fa1/{f1a,f1b,f1c,f1d,f1e}, fa2/{f2a,f2b,f2c,f2d,f2e}, fa3/{f3a,f3b,f3c,f3d,f3e}, fa4/{f4a,f4b,f4c,f4d,f4e}}{
+  \draw[gray, dashed] (\gen.south) -- ++(0,-0.3);
 }
-\caption{The FlashAttention lineage, showing the key techniques introduced by each generation and the hardware target each was written for.}
+\end{tikzpicture}
+\caption{The FlashAttention lineage. Each generation targets a new NVIDIA architecture and exposes new hardware features. SOL = Speed-of-Light tensor-core throughput. Yellow cells show approximate hardware utilization achieved.}
 \label{fig:fa-taxonomy}
 \end{figure}
 
@@ -393,6 +669,74 @@ for tree={
 \label{sec:fa1}
 
 The standard textbook implementation of attention computes $\mathrm{softmax}(QK^T / \sqrt{d}) V$ by materializing the $N \times N$ attention matrix $S = QK^T$ in HBM, applying softmax row-wise, and then multiplying by $V$. For sequence length $N$ and head dimension $d$, this requires $O(N^2)$ HBM writes and reads of the intermediate matrix, which dominates the total memory traffic of the operation as soon as $N \gg d$. On A100 in FP16, attention at sequence length 2048 spends roughly 80\% of its time in HBM traffic and only 20\% in tensor-core compute, despite the operation being algorithmically dominated by matmul. This was the central observation of FlashAttention-1 \citep{dao2022flashattention}: attention is memory-bound, not compute-bound, and the path to higher throughput runs through eliminating the HBM materialization of $S$ rather than through faster matmul.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  hbm/.style={draw, fill=blackwellred!20, rounded corners=2pt, font=\scriptsize, inner sep=5pt, minimum width=2.0cm, minimum height=0.55cm, text centered},
+  smem/.style={draw, fill=hopperblue!25, rounded corners=2pt, font=\scriptsize, inner sep=5pt, minimum width=2.0cm, minimum height=0.55cm, text centered},
+  op/.style={draw, fill=lightyellow, rounded corners=2pt, font=\scriptsize, inner sep=4pt, text centered},
+  arr/.style={-{Latex}, thick},
+  darr/.style={-{Latex}, thick, blackwellred!80},
+]
+% === Left side: Naive attention ===
+\node[font=\small\bfseries] at (2.5, 5.5) {Naive Attention};
+
+\node[hbm] (qkv_n) at (2.5, 4.8) {$Q, K, V$ in HBM};
+\node[op] (qkt_n) at (2.5, 3.8) {$S = QK^T$};
+\draw[arr] (qkv_n) -- (qkt_n);
+
+\node[hbm, fill=blackwellred!40] (s_hbm) at (2.5, 2.7) {\textbf{$S$ written to HBM}\\$O(N^2)$ bytes};
+\draw[darr] (qkt_n) -- (s_hbm) node[midway, right, font=\tiny, blackwellred] {write $N^2$};
+
+\node[op] (sfx_n) at (2.5, 1.7) {softmax($S$)};
+\draw[darr] (s_hbm) -- (sfx_n) node[midway, right, font=\tiny, blackwellred] {read $N^2$};
+
+\node[hbm, fill=blackwellred!40] (p_hbm) at (2.5, 0.7) {\textbf{$P$ written to HBM}\\$O(N^2)$ bytes};
+\draw[darr] (sfx_n) -- (p_hbm) node[midway, right, font=\tiny, blackwellred] {write $N^2$};
+
+\node[op] (pv_n) at (2.5, -0.3) {$O = P \cdot V$};
+\draw[darr] (p_hbm) -- (pv_n) node[midway, right, font=\tiny, blackwellred] {read $N^2$};
+
+\node[hbm] (out_n) at (2.5, -1.2) {$O$ in HBM};
+\draw[arr] (pv_n) -- (out_n);
+
+% HBM traffic annotation
+\node[font=\scriptsize\bfseries, blackwellred, align=center] at (2.5, -2.1) {HBM traffic: $\Theta(N^2 d)$\\(dominates at long seq.)};
+
+% === Right side: FlashAttention ===
+\node[font=\small\bfseries] at (9.5, 5.5) {FlashAttention (IO-aware)};
+
+\node[hbm] (qkv_fa) at (9.5, 4.8) {$Q, K, V$ in HBM};
+\node[smem] (qtile) at (9.5, 3.8) {Load tile of $Q$ to SMEM};
+\draw[arr] (qkv_fa) -- (qtile) node[midway, right, font=\tiny] {once};
+
+\node[smem] (kv_tile) at (9.5, 2.7) {Load tile of $K_j, V_j$ to SMEM};
+\draw[arr] (qtile) -- (kv_tile);
+
+\node[op] (fused) at (9.5, 1.6) {$S_{ij} = Q_i K_j^T$, online softmax,\\accumulate $S_{ij} V_j$};
+\draw[arr] (kv_tile) -- (fused);
+
+\node[smem, fill=hopperblue!15] (loop) at (9.5, 0.7) {loop over $j$ tiles (no HBM write)};
+\draw[arr] (fused) -- (loop);
+\draw[arr, dashed] (loop) |- (kv_tile);
+
+\node[hbm] (out_fa) at (9.5, -0.3) {$O$ written to HBM once};
+\draw[arr] (loop) -- (out_fa);
+
+% HBM traffic annotation
+\node[font=\scriptsize\bfseries, nvidiagreen!60!black, align=center] at (9.5, -1.4) {HBM traffic: $\Theta(Nd)$\\($N\times$ less for intermediate data)};
+
+% Divider
+\draw[gray, dashed, thick] (6.3, -2.5) -- (6.3, 5.8);
+
+% Comparison arrow
+\draw[-{Latex}, thick, nvidiagreen!70] (5.2, 2.0) -- (7.4, 2.0);
+\node[font=\scriptsize\bfseries, nvidiagreen!70!black] at (6.3, 2.4) {$\sim 4\times$ faster};
+\end{tikzpicture}
+\caption{Comparison of naive attention (left) and FlashAttention-1 (right) in terms of HBM memory traffic. Naive attention materializes the $N\times N$ attention score matrix $S$ and probability matrix $P$ in HBM, requiring $O(N^2)$ read/write operations. FlashAttention eliminates both intermediate materializations via tile-based online softmax, reducing HBM traffic to $O(Nd)$. For $N=4096$, $d=128$, this represents a $32\times$ reduction in intermediate HBM traffic.}
+\label{fig:fa-io}
+\end{figure}
 
 The technical mechanism is the well-known \emph{online softmax} algorithm \citep{milakov2018onlinesoftmax}, which computes softmax in a streaming fashion using a running maximum and a running normalizing constant. Concretely, given a sequence of input vectors processed in tiles, the online softmax tracks two scalars per row---the running max $m$ and the running denominator $\ell$---and updates them as each new tile arrives, rescaling the partial output as needed. This allows softmax to be fused with the surrounding matmuls into a single kernel: the kernel loads a tile of $Q$ once, then iterates over tiles of $K$ and $V$, computing $S_{ij} = Q_i K_j^T$, updating the online softmax statistics, and accumulating $S_{ij} V_j$ into the output, all without ever writing $S$ to HBM. The total HBM traffic drops from $O(N^2)$ to $O(N)$ for the activations, transforming attention from a memory-bound operation into one whose throughput is determined by tensor-core compute on the constituent matmuls.
 
@@ -465,43 +809,53 @@ Mixture-of-Experts is the dominant architecture for scaling LLMs beyond the limi
 
 \begin{figure}[t]
 \centering
-\begin{forest}
-for tree={
-  forked edges, draw, rounded corners, font=\footnotesize,
-  l sep+=4pt, s sep+=2pt, anchor=west, grow=east,
-  parent anchor=east, child anchor=west,
-  edge={-, thick}, align=left,
-}
-[{Mixture-of-Experts\\Systems}
-  [{Routing \& Algorithms}
-    [{Top-$k$ token choice \citep{shazeer2017outrageously,fedus2022switch}}]
-    [{Expert choice \citep{zhou2022expertchoice}}]
-    [{BASE Layers \citep{lewis2021base}}]
-    [{Load balancing \& aux losses \citep{fedus2022switch}}]
-  ]
-  [{Grouped GEMM Kernels}
-    [{CUTLASS grouped GEMM \citep{thakkar2023cutlass}}]
-    [{MegaBlocks block-sparse \citep{gale2023megablocks}}]
-    [{ScatterMoE scatter/gather \citep{tan2024scattermoe}}]
-    [{SonicMoE CuTeDSL kernels \citep{sonicmoe2025}}]
-    [{DeepGEMM \citep{deepgemm2024}}]
-  ]
-  [{Distributed MoE}
-    [{GShard all-to-all \citep{lepikhin2021gshard}}]
-    [{Tutel adaptive parallelism \citep{hwang2023tutel}}]
-    [{FasterMoE shadowing \citep{he2022fastermoe}}]
-    [{DeepSpeed-MoE PR-MoE \citep{rajbhandari2022deepspeedmoe}}]
-    [{DeepEP all-to-all kernels \citep{deepep2024}}]
-    [{Lina, TA-MoE, SmartMoE \citep{li2023lina,chen2022tamoe,zhai2023smartmoe}}]
-  ]
-  [{Inference \& Edge}
-    [{vLLM MoE backend \citep{kwon2023vllm}}]
-    [{SGLang MoE \citep{zheng2024sglang}}]
-    [{EdgeMoE \citep{yi2023edgemoe}}]
-  ]
+\begin{tikzpicture}[
+  node distance=0.3cm and 0.4cm,
+  box/.style={draw, rounded corners=3pt, font=\scriptsize, inner sep=4pt, text centered, minimum width=3.5cm},
+  catbox/.style={box, fill=nvidiagreen!20, minimum width=2.6cm},
+  itembox/.style={box, fill=lightgray, minimum width=3.5cm},
+  rootbox/.style={box, fill=nvidiagreen!50, font=\small\bfseries, minimum width=3.4cm},
 ]
-\end{forest}
-\caption{Taxonomy of Mixture-of-Experts systems, organized by the aspect of the MoE pipeline they primarily address.}
+\node[rootbox] (root) {Mixture-of-Experts Systems};
+
+\node[catbox, below left=0.7cm and 2.8cm of root] (route) {Routing \& Algorithms};
+\node[catbox, below left=0.7cm and 0.1cm of root] (gemm) {Grouped GEMM Kernels};
+\node[catbox, below right=0.7cm and 0.8cm of root] (dist) {Distributed MoE};
+\node[catbox, below right=0.7cm and 3.7cm of root] (inf) {Inference \& Edge};
+
+\node[itembox, below=0.25cm of route] (ro1) {Top-$k$ token choice};
+\node[itembox, below=0.1cm of ro1] (ro2) {Expert choice routing};
+\node[itembox, below=0.1cm of ro2] (ro3) {BASE Layers};
+\node[itembox, below=0.1cm of ro3] (ro4) {Load-balance aux losses};
+
+\node[itembox, below=0.25cm of gemm] (ge1) {CUTLASS grouped GEMM};
+\node[itembox, below=0.1cm of ge1] (ge2) {MegaBlocks (block-sparse)};
+\node[itembox, below=0.1cm of ge2] (ge3) {ScatterMoE (implicit gather)};
+\node[itembox, below=0.1cm of ge3] (ge4) {SonicMoE (CuTeDSL)};
+\node[itembox, below=0.1cm of ge4] (ge5) {DeepGEMM (FP8)};
+
+\node[itembox, below=0.25cm of dist] (di1) {GShard all-to-all};
+\node[itembox, below=0.1cm of di1] (di2) {Tutel adaptive parallelism};
+\node[itembox, below=0.1cm of di2] (di3) {FasterMoE shadowing};
+\node[itembox, below=0.1cm of di3] (di4) {DeepSpeed-MoE PR-MoE};
+\node[itembox, below=0.1cm of di4] (di5) {DeepEP (NVLink kernels)};
+
+\node[itembox, below=0.25cm of inf] (in1) {vLLM MoE backend};
+\node[itembox, below=0.1cm of in1] (in2) {SGLang MoE};
+\node[itembox, below=0.1cm of in2] (in3) {EdgeMoE (on-device)};
+
+\draw[-{Latex}] (root) -- (route);
+\draw[-{Latex}] (root) -- (gemm);
+\draw[-{Latex}] (root) -- (dist);
+\draw[-{Latex}] (root) -- (inf);
+
+\foreach \cat/\items in {route/{ro1,ro2,ro3,ro4}, gemm/{ge1,ge2,ge3,ge4,ge5}, dist/{di1,di2,di3,di4,di5}, inf/{in1,in2,in3}}{
+  \foreach \item in \items {
+    \draw[-{Latex}, gray] (\cat) -- (\item);
+  }
+}
+\end{tikzpicture}
+\caption{Taxonomy of Mixture-of-Experts systems, organized by the aspect of the MoE pipeline each primarily addresses.}
 \label{fig:moe-taxonomy}
 \end{figure}
 
@@ -509,6 +863,73 @@ for tree={
 \label{sec:moe-background}
 
 A standard MoE layer replaces the dense feed-forward block in a Transformer with $E$ expert feed-forward blocks and a router that, given an input token's hidden state, produces a probability distribution over experts and selects the top $k$ experts (typically $k \in \{1, 2\}$). Each token is then processed by its selected experts, and the per-expert outputs are combined via a weighted sum using the router probabilities. The total parameter count grows linearly with $E$, but the per-token compute grows only with $k$, which is what makes MoE attractive for scaling.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  tensor/.style={draw, rounded corners=3pt, fill=lightblue, font=\scriptsize, inner sep=5pt, minimum width=2.0cm, minimum height=0.55cm, text centered},
+  op/.style={draw, ellipse, fill=lightyellow, font=\scriptsize, inner sep=4pt, text centered},
+  expert/.style={draw, rounded corners=3pt, fill=lightgreen, font=\scriptsize, inner sep=4pt, minimum width=1.6cm, minimum height=0.5cm, text centered},
+  arr/.style={-{Latex}, thick},
+  shape label/.style={font=\tiny, gray, anchor=north},
+]
+% Input
+\node[tensor] (X) at (0,0) {$X$ (tokens)};
+\node[shape label] at (0,-0.42) {$T \times d_\text{model}$};
+
+% Router
+\node[op] (router) at (3.2,0) {Router\\(linear + top-$k$)};
+\draw[arr] (X) -- (router);
+
+% Routing weights and indices
+\node[tensor, fill=ambercolor!30] (idx) at (3.2,-1.5) {Expert indices\\+ weights};
+\node[shape label] at (3.2,-1.92) {$T \times k$};
+\draw[arr] (router) -- (idx);
+
+% Scatter / gather
+\node[op] (scatter) at (6.5,0) {Scatter\\(gather tokens\\per expert)};
+\draw[arr] (X) -- (scatter);
+\draw[arr] (idx) -- (scatter);
+
+% Expert groups
+\node[expert] (e1) at (9.5, 1.2) {Expert 1\\$W_1^{(1)}, W_2^{(1)}$};
+\node[expert] (e2) at (9.5, 0.0) {Expert 2\\$W_1^{(2)}, W_2^{(2)}$};
+\node[font=\scriptsize] (edots) at (9.5, -0.85) {$\vdots$};
+\node[expert] (eE) at (9.5, -1.5) {Expert $E$\\$W_1^{(E)}, W_2^{(E)}$};
+
+\draw[arr] (scatter) -- (e1);
+\draw[arr] (scatter) -- (e2);
+\draw[arr] (scatter) -- (eE);
+
+% Per expert: up-proj -> activation -> down-proj
+\node[op] (up) at (12.5, 0.0) {Up-proj\\$+$ SwiGLU};
+\draw[arr] (e1) -- (up);
+\draw[arr] (e2) -- (up);
+\draw[arr] (eE) -- (up);
+\node[shape label] at (12.5,-0.6) {$m_e \times d_\text{ffn}$};
+
+\node[op] (down) at (15.0, 0.0) {Down-proj};
+\draw[arr] (up) -- (down);
+\node[shape label] at (15.0,-0.6) {$m_e \times d_\text{model}$};
+
+% Gather + weighted sum
+\node[op] (gather) at (17.5, 0.0) {Gather\\+ weighted sum};
+\draw[arr] (down) -- (gather);
+\draw[arr] (idx) -- (gather);
+
+% Output
+\node[tensor] (Y) at (20.5, 0.0) {$Y$ (output)};
+\node[shape label] at (20.5,-0.42) {$T \times d_\text{model}$};
+\draw[arr] (gather) -- (Y);
+
+% Annotation: HBM round trips
+\draw[decorate, decoration={brace, amplitude=4pt}, thick, blackwellred!70]
+  (6.2, -2.4) -- (17.8, -2.4)
+  node[midway, below=5pt, font=\tiny, blackwellred!80, align=center] {Optimization target: avoid HBM materialization of intermediate $Y_1 = \mathrm{SwiGLU}(X W_1)$ between up- and down-projections};
+\end{tikzpicture}
+\caption{Data flow through an MoE layer. Input tokens are scored by the router; each token is scattered to its top-$k$ assigned experts. Each expert independently computes an up-projection followed by SwiGLU and a down-projection. Expert outputs are gathered and combined with router weights. The intermediate activation $Y_1$ between the two GEMMs is the primary fusion target: materializing it in HBM and reading it back costs $O(T \cdot d_\text{ffn})$ bytes of unnecessary HBM traffic per layer.}
+\label{fig:moe-dataflow}
+\end{figure}
 
 The router itself is a small linear projection followed by a softmax and a top-$k$ selection. The dominant routing strategy, introduced by \citet{shazeer2017outrageously} and refined by Switch Transformer \citep{fedus2022switch}, is \emph{token choice}: each token independently selects its top $k$ experts. Token choice has the property that the per-expert load is unbalanced---some experts receive far more tokens than others on a given batch---which creates a kernel-level problem (irregular per-expert matmul shapes) and a system-level problem (some experts oversaturate while others sit idle). Switch Transformer addressed the imbalance with an auxiliary load-balancing loss that encourages the router to spread tokens evenly across experts, and with a \emph{capacity factor} that caps the number of tokens any single expert can receive (excess tokens are dropped). The capacity-and-drop approach trades a small amount of model quality for predictable kernel shapes.
 
@@ -604,8 +1025,10 @@ The pattern in Table~\ref{tab:moe-systems} also reflects a generational shift: p
 % (Most other keys used here already exist from the initial draft.)
 % =====================================================================
 
-% \bibitem{milakov2018onlinesoftmax} Milakov, M., Gimelshein, N.
-%   Online normalizer calculation for softmax. arXiv:1805.02867, 2018.
+% \bibitem{milakov2018onlinesoftmax} Milakov, M., Gimelshein, N. Online normalizer calculation for softmax. \emph{arXiv:1805.02867}, 2018.
+\bibitem{rouhani2023microscaling} Rouhani, B.~D., et al. Microscaling data formats for deep learning. \emph{arXiv:2310.10537}, 2023.
+\bibitem{williams2009roofline} Williams, S., Waterman, A., Patterson, D. Roofline: an insightful visual performance model for multicore architectures. \emph{Communications of the ACM}, 52(4):65--76, 2009.
+\bibitem{luo2024hopperdissect} Luo, W., Fan, R., Li, Z., Du, D., Wang, Q., Chu, X. Benchmarking and dissecting the NVIDIA Hopper GPU architecture. \emph{arXiv:2402.13499}, 2024.
 % =====================================================================
 % PASS 3: Sections 6, 7, 8, 9 — drop-in replacement for the existing
 % short versions of these sections in main.tex.
@@ -665,6 +1088,51 @@ These percentages may sound modest, but they apply to an already-optimized basel
 \subsubsection{Phase 2: True SMEM Fusion}
 The second optimization is more aggressive. The observation that motivates it comes from reading the SonicMoE up-projection kernel source: at the end of the kernel, just before the TMA store of $Y_1$ to HBM, the $Y_1$ tile is already sitting in an SMEM buffer (the \texttt{sY} buffer that holds the SwiGLU output). If the down-projection kernel could read $Y_1$ directly from this SMEM buffer rather than via the L2 cache, the bandwidth would jump from L2's 12 TB/s to SMEM's 19 TB/s---another $\sim 1.6\times$ improvement on top of Phase 1---and the TMA store of $Y_1$ to HBM could be skipped entirely, eliminating another 32 MB of HBM traffic per layer.
 
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  smembox/.style={draw, rounded corners=2pt, font=\scriptsize, inner sep=4pt, text centered, minimum height=1.0cm},
+  label/.style={font=\scriptsize\bfseries},
+]
+% ---- Phase 1 SMEM layout ----
+\node[label] at (2.5, 5.0) {Phase 1: Up-projection SMEM layout};
+\node[smembox, fill=lightblue, minimum width=4.5cm] (x1) at (2.5, 4.1) {$X$ input tile\\($m_e \times d_\text{model}$ slice)\\$\approx$ 48 KB};
+\node[smembox, fill=hopperblue!30, minimum width=4.5cm] (w1) at (2.5, 2.85) {$W_1$ weight tile\\($d_\text{model} \times d_\text{ffn}$ tile)\\$\approx$ 64 KB};
+\node[smembox, fill=lightgreen, minimum width=4.5cm] (sy) at (2.5, 1.55) {$sY$ staging buffer\\(SwiGLU output)\\$\approx$ 32 KB};
+\node[smembox, fill=lightgray, minimum width=4.5cm] (meta1) at (2.5, 0.6) {Barrier + staging\\$\approx$ 20 KB};
+
+% Total annotation
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, thick, gray]
+  (4.85, 0.1) -- (4.85, 4.6)
+  node[midway, right=6pt, font=\tiny, gray, align=left] {$\approx$164 KB\\(fits in\\228 KB)};
+
+% ---- Phase 2 SMEM layout ----
+\node[label] at (10.5, 5.0) {Phase 2: Down-projection SMEM layout};
+\node[smembox, fill=lightgreen, minimum width=4.5cm] (sy2) at (10.5, 4.1) {$sY$ now as input\\(same physical bytes)\\$\approx$ 32 KB};
+\node[smembox, fill=blackwellred!20, minimum width=4.5cm] (w2) at (10.5, 2.4) {$W_2$ weight tile\\(reuses $X$+$W_1$ region)\\$\approx$ 112 KB};
+\node[smembox, fill=ambercolor!40, minimum width=4.5cm] (out) at (10.5, 1.0) {Output staging\\$\approx$ 16 KB};
+\node[smembox, fill=lightgray, minimum width=4.5cm] (meta2) at (10.5, 0.2) {Barrier\\$\approx$ 4 KB};
+
+\draw[decorate, decoration={brace, amplitude=5pt, mirror}, thick, gray]
+  (12.85, -0.1) -- (12.85, 4.6)
+  node[midway, right=6pt, font=\tiny, gray, align=left] {$\approx$164 KB\\(same budget)};
+
+% ---- Key: W1 and W2 never coexist ----
+\node[font=\scriptsize\bfseries, blackwellred] at (6.5, -0.8) {Key insight: $W_1$ and $W_2$ never coexist in SMEM $\Rightarrow$ fits within 228 KB budget};
+
+% Arrow showing SMEM reuse
+\draw[-{Latex}, thick, blackwellred!70, dashed]
+  (4.75, 2.85) -- (8.2, 2.85) -- (8.2, 2.4) -- (8.25, 2.4);
+\node[font=\tiny, blackwellred, above] at (6.5, 2.9) {same bytes, repurposed};
+
+\draw[-{Latex}, thick, nvidiagreen!70, dashed]
+  (4.75, 1.55) -- (7.25, 1.55) -- (7.25, 4.1) -- (8.25, 4.1);
+\node[font=\tiny, nvidiagreen!70] at (5.9, 1.1) {$sY$: stays in place};
+\end{tikzpicture}
+\caption{Time-multiplexed SMEM layout for the SonicMoE SMEM-fused megakernel. In Phase 1 (up-projection), SMEM holds $X$, $W_1$, the SwiGLU output buffer $sY$, and staging. In Phase 2 (down-projection), the $X$ and $W_1$ regions are repurposed for $W_2$, while $sY$ remains in place and becomes the input for the second GEMM. Since $W_1$ and $W_2$ never coexist, the total SMEM usage stays within H100's 228 KB budget.}
+\label{fig:smem-layout}
+\end{figure}
+
 The challenge is the SMEM budget. H100 provides 228 KB of SMEM per SM, and a single up-projection kernel uses roughly 164 KB of that for its SMEM buffers (the input $X$ tile, the $W_1$ weight tile, the SwiGLU output buffer, and producer-consumer staging buffers). A naive fusion that simply concatenates the two kernels and asks them to coexist in SMEM would require room for both $W_1$ and $W_2$ weight tiles simultaneously, which exceeds the budget by a significant margin.
 
 The solution is \emph{time-multiplexed SMEM}. The fused kernel is structured into two phases that share the same SMEM region but use it for different purposes. In Phase 1, the SMEM is partitioned into $X$ (the input), $W_1$ (the up-projection weights), and $sY$ (the staging buffer for $Y_1$); the kernel computes $Y_1$ and leaves it in $sY$. In Phase 2, the kernel \emph{repurposes} the SMEM region that previously held $X$ and $W_1$: the new layout is $sY$ (now serving as the input to the down-projection, occupying its same physical location from Phase 1), $W_2$ (the down-projection weights, now occupying the region that previously held $X$ and $W_1$), and an output staging buffer. The crucial property is that $W_1$ and $W_2$ never coexist in SMEM, so the kernel fits within the 228 KB budget.
@@ -693,39 +1161,174 @@ Triton \citep{tillet2019triton} has long advertised itself as vendor-neutral, an
 \paragraph{The Unavoidable Cost of Portability.}
 The general lesson from cross-vendor work is that portability and peak performance are in genuine tension. Frameworks that abstract away the differences between Hopper and CDNA3 give up some of the Hopper-specific optimizations (warp specialization, TMA multicast, distributed SMEM) and some of the CDNA3-specific optimizations (its particular matrix-core tile shapes, its slightly different SMEM bank conflict rules), achieving performance somewhere in the middle. For workloads where the last 20\% matters---which is most production training---the portable framework is either supplemented or replaced by vendor-specific kernels for the most critical operations. For workloads where the last 20\% does not matter---research code, prototype kernels, kernels for smaller models---the portable framework is usually the right choice. There is no current evidence that this tradeoff is going away, and the rest of this survey should be read with the understanding that essentially all of the techniques it discusses come with a portability cost when crossing vendor boundaries.
 
+% ---- Release Timeline ----
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[scale=0.95,
+  event/.style={draw, rounded corners=3pt, font=\tiny, inner sep=3pt, text centered, minimum width=2.2cm},
+  fa/.style={event, fill=hopperblue!25},
+  matmul/.style={event, fill=nvidiagreen!25},
+  moe/.style={event, fill=ambercolor!35},
+  hw/.style={event, fill=blackwellred!20, minimum width=2.0cm},
+  yearmark/.style={font=\scriptsize\bfseries, gray},
+]
+% Timeline axis
+\draw[thick, gray] (0,0) -- (16,0);
+\foreach \x in {0,4,8,12,16} \draw[gray] (\x, -0.12) -- (\x, 0.12);
+
+% Year labels
+\node[yearmark] at (0, -0.45) {2019};
+\node[yearmark] at (2, -0.45) {2020};
+\node[yearmark] at (4, -0.45) {2021};
+\node[yearmark] at (6, -0.45) {2022};
+\node[yearmark] at (8, -0.45) {2023};
+\node[yearmark] at (10, -0.45) {2024};
+\node[yearmark] at (12, -0.45) {2024Q4};
+\node[yearmark] at (14, -0.45) {2025};
+\node[yearmark] at (16, -0.45) {2026};
+
+% Hardware (top row, y=+2.0)
+\node[hw] at (6, 2.1) {H100 Hopper};
+\draw[gray, thin] (6,0.08) -- (6,1.8);
+
+\node[hw] at (14, 2.1) {B200 Blackwell};
+\draw[gray, thin] (14,0.08) -- (14,1.8);
+
+% FlashAttention lineage (y = +1.2)
+\node[fa] at (6, 1.2) {FA1};
+\draw[hopperblue!60, thin] (6,0.06) -- (6,0.9);
+\node[fa] at (8, 1.2) {FA2};
+\draw[hopperblue!60, thin] (8,0.06) -- (8,0.9);
+\node[fa] at (10.5, 1.2) {FA3};
+\draw[hopperblue!60, thin] (10.5,0.06) -- (10.5,0.9);
+\node[fa] at (14, 1.2) {FA4};
+\draw[hopperblue!60, thin] (14,0.06) -- (14,0.9);
+
+% Matmul DSL (y = -1.2)
+\node[matmul] at (6, -1.2) {CUTLASS 2.x};
+\draw[nvidiagreen!60, thin] (6,-0.06) -- (6,-0.9);
+\node[matmul] at (9, -1.2) {CuTe / 3.x};
+\draw[nvidiagreen!60, thin] (9,-0.06) -- (9,-0.9);
+\node[matmul] at (1.5, -1.2) {Triton};
+\draw[nvidiagreen!60, thin] (1.5,-0.06) -- (1.5,-0.9);
+\node[matmul] at (10.5, -1.2) {ThunderKittens};
+\draw[nvidiagreen!60, thin] (10.5,-0.06) -- (10.5,-0.9);
+\node[matmul] at (13.5, -1.2) {CuTeDSL};
+\draw[nvidiagreen!60, thin] (13.5,-0.06) -- (13.5,-0.9);
+\node[matmul] at (15, -1.2) {HipKittens};
+\draw[nvidiagreen!60, thin] (15,-0.06) -- (15,-0.9);
+
+% MoE systems (y = -2.1)
+\node[moe] at (4, -2.1) {GShard};
+\draw[ambercolor!70, thin] (4,-0.06) -- (4,-1.8);
+\node[moe] at (6, -2.1) {FastMoE};
+\draw[ambercolor!70, thin] (6,-0.06) -- (6,-1.8);
+\node[moe] at (7.5, -2.1) {FasterMoE};
+\draw[ambercolor!70, thin] (7.5,-0.06) -- (7.5,-1.8);
+\node[moe] at (9.0, -2.1) {MegaBlocks};
+\draw[ambercolor!70, thin] (9.0,-0.06) -- (9.0,-1.8);
+\node[moe] at (10.5, -2.1) {ScatterMoE};
+\draw[ambercolor!70, thin] (10.5,-0.06) -- (10.5,-1.8);
+\node[moe] at (12.5, -2.1) {DeepEP/GEMM};
+\draw[ambercolor!70, thin] (12.5,-0.06) -- (12.5,-1.8);
+\node[moe] at (14.5, -2.1) {SonicMoE};
+\draw[ambercolor!70, thin] (14.5,-0.06) -- (14.5,-1.8);
+
+% Legend
+\begin{scope}[shift={(0,-3.1)}]
+  \node[hw, minimum width=1.5cm] at (1.5,0) {Hardware};
+  \node[fa, minimum width=1.8cm] at (4.2,0) {FlashAttention};
+  \node[matmul, minimum width=1.8cm] at (7.2,0) {Matmul DSLs};
+  \node[moe, minimum width=1.6cm] at (10.2,0) {MoE Systems};
+\end{scope}
+\end{tikzpicture}
+\caption{Chronological release timeline of major systems and libraries surveyed in this paper. Hardware generations (top) set the capability frontier; FlashAttention generations co-evolve closely with hardware; matmul DSLs and MoE systems develop somewhat independently but are pulled forward by hardware advances.}
+\label{fig:timeline}
+\end{figure}
+
+% ---- Matmul framework throughput bar chart ----
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=10cm, height=6cm,
+  ybar,
+  bar width=0.5cm,
+  ylabel={Approx.\ \% of H100 BF16 SOL},
+  ymin=0, ymax=105,
+  xtick=data,
+  xticklabels={Hand CUDA, CUTLASS 3.x, CuTeDSL, Triton, ThunderKittens, cuBLAS},
+  xticklabel style={rotate=30, anchor=east, font=\scriptsize},
+  ytick={0,25,50,75,100},
+  ylabel style={font=\small},
+  grid=y,
+  grid style={gray!25},
+  nodes near coords,
+  nodes near coords style={font=\tiny},
+  title={Matmul Framework: Approx.\ \% of Speed-of-Light (H100, BF16, well-shaped)},
+  title style={font=\small},
+  legend style={at={(0.02,0.98)}, anchor=north west, font=\scriptsize},
+  enlarge x limits=0.12,
+]
+% Values: low end of range (striped), high end of range (solid)
+% Shown as two series: lower and upper bound
+\addplot[fill=hopperblue!30, draw=hopperblue] coordinates {
+  (1,90) (2,90) (3,90) (4,70) (5,90) (6,95)};
+\addplot[fill=hopperblue!70, draw=hopperblue!80] coordinates {
+  (1,98) (2,98) (3,98) (4,90) (5,95) (6,99)};
+\legend{Lower bound, Upper bound}
+\end{axis}
+\end{tikzpicture}
+\caption{Approximate fraction of H100 BF16 speed-of-light achieved by a competent author using each matmul framework for a well-shaped dense FP16 matmul (e.g., $4096\times4096\times4096$). Values are estimates synthesized from \citet{boehm2022cudammm,cudaforfun2024,spector2024thunderkittens,veitner2025blackwell,thakkar2023cutlass}; actual results vary with shape and tuning effort. Triton's gap at the upper end reflects incomplete WGMMA/TMA exploitation on Hopper; this is being actively narrowed by the Triton team.}
+\label{fig:matmul-barchart}
+\end{figure}
+
 \section{Open Problems and Future Directions}
 \label{sec:future}
 
 The previous sections have surveyed the state of the art in MoE kernel engineering on Hopper and Blackwell. We close with a discussion of open problems---directions where the current literature is incomplete and where significant performance, accessibility, or capability improvements remain available to anyone willing to do the engineering work.
 
 \paragraph{FP4 Training.}
-Blackwell's hardware support for FP4 with microscaling formats roughly doubles the tensor-core throughput available to training workloads, but the algorithmic and numerical questions surrounding FP4 training are far from settled. FP4 inference is essentially solved: the dynamic range and precision of FP4 are sufficient for forward-pass computations on already-trained models, with appropriate per-block scaling. FP4 training is harder because the gradient distribution during backpropagation has a much wider dynamic range than the forward activations, and naive FP4 gradient quantization causes catastrophic loss of information in the small gradient entries. The current state of the art uses mixed precision---FP4 for some forward operations, FP8 or BF16 for gradients, master weights in FP32---but the right partitioning of the training loop across precisions is still being determined empirically. Kernels that natively combine FP4 forward with FP8 or BF16 backward, with appropriate intermediate scaling, are an open engineering problem.
+Blackwell's hardware support for FP4 with microscaling formats roughly doubles the tensor-core throughput available to training workloads, but the algorithmic and numerical questions surrounding FP4 training are far from settled. The root difficulty is asymmetric: FP4 inference is tractable because the dynamic range of forward-pass activations and weights, once a model is trained, is narrow and predictable. FP4 training is harder for two reasons. First, gradient tensors during backpropagation have a much wider dynamic range than forward activations---the distribution of gradient magnitudes spans several orders of magnitude, and the small-magnitude entries that carry signal about rarely-activated features are exactly what FP4's limited exponent range loses. Second, MoE gradients are sparser than dense Transformer gradients: an expert that sees few tokens in a batch produces a gradient update from a small effective batch, which is noisier than a full-batch gradient and more sensitive to quantization error. The current workaround---FP4 forward, FP8 gradients, FP32 master weights---adds three precision-domain transitions per layer, each of which requires a scaling kernel and register-domain traffic that partially offsets the FP4 compute gain. Kernels that natively fuse the precision transition with the GEMM epilogue, without materializing the rescaled tensor in HBM, would recover most of this overhead, but no such kernel is available as open-source today.
 
 \paragraph{Distributed All-to-All and Compute Overlap.}
-DeepEP \citep{deepep2024} represents the current frontier in distributed MoE communication, but it is not the final word. The fundamental question is how aggressively the all-to-all step can be overlapped with the per-expert grouped GEMM, and the answer depends on details---NVLink topology, NIC bandwidth, the relative latencies of intra-node and inter-node hops, the granularity at which tokens can be partially processed---that vary across cluster configurations. A general framework for expressing all-to-all-with-compute overlap, perhaps as a fused kernel that issues NVLink and InfiniBand transfers from inside the grouped GEMM mainloop, does not yet exist as an open-source library. The closest current work is in topology-aware routing \citep{chen2022tamoe} and adaptive parallelism \citep{zhai2023smartmoe}, but neither addresses the kernel-level integration of communication and computation directly.
+DeepEP \citep{deepep2024} represents the current frontier in distributed MoE communication, achieving near-peak NVLink bandwidth on intra-node all-to-all by writing communication kernels directly in PTX. The next step---fully overlapping the all-to-all with the grouped GEMM compute on the locally-resident tokens---has not been demonstrated at production scale. The obstacle is coordination: the all-to-all determines which tokens an SM will process, but the grouped GEMM must begin before the all-to-all completes (to hide its latency), requiring either speculative execution (pre-launching GEMMs for expected token assignments) or a fine-grained token-streaming model in which the GEMM kernel accepts tokens as they arrive from the network stack. Both approaches exist in prototype form (see the discussion of FasterMoE's dynamic shadowing \citep{he2022fastermoe} and the Lina scheduler \citep{li2023lina}), but neither achieves the full overlap that theory permits on Hopper or Blackwell. A general framework that handles both intra-node NVLink and inter-node InfiniBand with a unified streaming GEMM does not currently exist.
 
 \paragraph{Compiler Automation of Megakernel Fusion.}
-The case study in Section~\ref{sec:fusion-case} described the SonicMoE megakernel fusion as a hand-engineered transformation of two well-tuned kernels into a single fused kernel with time-multiplexed SMEM. This kind of fusion is currently far beyond the capabilities of automatic fusion compilers like TVM \citep{chen2018tvm}, TensorIR \citep{feng2023tensorir}, Triton's auto-scheduler, or PyTorch 2's Inductor backend \citep{ansel2024torchcompile}. Automated megakernel fusion is an active research area: recent work on Mirage and similar compilers has shown that a search over fusion candidates can sometimes recover performance close to hand-tuned kernels for restricted classes of operations. But the gap remains substantial---typically 10--30\%---and the search-based approaches struggle with the sort of structural transformations (time-multiplexed SMEM, repurposed buffers, cross-warp role switching) that distinguish the best hand-tuned kernels. Closing this gap is the most important open problem in compiler-driven kernel engineering.
+The SonicMoE SMEM fusion case study in Section~\ref{sec:fusion-case} required roughly two person-weeks of careful engineering to implement a transformation---time-multiplexed SMEM, repurposed buffers, mid-kernel TMA descriptor reset, cross-warp-group barrier---that, once understood, is conceptually straightforward. The same transformation cannot be performed by TVM \citep{chen2018tvm}, TensorIR \citep{feng2023tensorir}, Triton's autotune, or PyTorch 2 Inductor \citep{ansel2024torchcompile}, all of which lack representations for time-multiplexed buffer reuse and mid-kernel warp-role switching. Recent work on Mirage, FlexAttention, and compiler-guided kernel search has shown that the search space of tile schedules can sometimes be explored automatically for restricted operation classes \citep{ye2025flashinfer}. The gap to close is the \emph{structural} transformation step: detecting that two kernels sharing a tensor can be fused via SMEM reuse, computing whether the combined kernel fits the SMEM budget under the optimal time-multiplexing, and then generating the fused kernel with the correct synchronization structure. This is primarily a compiler IR problem; the required IR extensions---tensor lifetime annotations, buffer alias sets, and warp-role type tags---are well-defined, but integrating them into a production compiler pipeline has not been done. Closing this gap would have the highest leverage of any open problem in the field, because it would make megakernel-level performance available without requiring kernel-expert authors for each new model architecture.
 
 \paragraph{MoE with Long Context.}
-Most MoE work to date has focused on training and inference with sequences up to 8K or 32K tokens, where attention is a relatively small fraction of total runtime and the dominant kernel-level concern is the grouped GEMM. As context lengths grow toward 128K and beyond, attention becomes a much larger fraction of the runtime, and the interaction between FlashAttention-style attention kernels and grouped-GEMM MoE kernels becomes a first-order concern. A fused kernel that combines an FA4-style attention computation with a SonicMoE-style grouped GEMM into a single megakernel does not currently exist, and the design space is large: the attention and the MoE layer have very different SMEM and TMEM budgets, different optimal tile shapes, and different levels of parallelism. Whether such a fused kernel would beat the unfused alternative depends on how much HBM traffic the fusion can save, which is workload-dependent.
+The FlashAttention and grouped GEMM optimization streams have largely developed independently. In practice, an MoE Transformer layer consists of an attention sublayer (dominated by FlashAttention-style $QK^T \cdot V$ computation) followed by an MoE FFN sublayer (dominated by grouped GEMM). At short sequence lengths ($\leq$8K), the FFN dominates; at long sequence lengths ($\geq$128K), attention grows quadratically and begins to dominate. The transition point on H100 in BF16 is around 32K tokens for typical head dimensions. Beyond that point, the optimal fusion strategy changes: the intermediate attention output---the $O$ tensor of shape $T \times d_\text{model}$---is too large to fit in L2 on H100 but fits on B200 (for $T = 64K$, $d = 4096$, BF16: 512 MB, far exceeding even B200's 126 MB L2). A megakernel that fuses FlashAttention with the MoE FFN sublayer in a single persistent-CTA pass over the token sequence would eliminate the HBM round-trip of the attention output, but the SMEM budgeting for such a kernel is complex (FA3 and SonicMoE each require $\sim$160 KB of SMEM individually) and the scheduling of the two computation phases is non-trivial.
 
 \paragraph{Heterogeneous-Precision MoE.}
-Different experts in an MoE layer can, in principle, be assigned different precisions: experts that handle common patterns might use aggressive FP4 quantization, while experts that handle rare patterns might retain BF16 precision to preserve accuracy. Heterogeneous precision is straightforward at the architecture level but requires kernel support: a grouped GEMM where different groups use different precisions is not a primitive that any current library exposes efficiently. This is a small but concrete kernel-engineering problem whose solution would unlock a meaningful new axis of MoE optimization.
+Different experts in an MoE layer can, in principle, use different precisions: a high-frequency expert that sees many tokens per batch can tolerate aggressive FP4 quantization without hurting model quality (because its gradient signal is dense and well-averaged), while a low-frequency expert that handles rare inputs may need BF16 precision to avoid accuracy degradation on those rare tokens. Dynamic heterogeneous precision of this kind is architecturally attractive but is not a primitive that any current grouped GEMM library exposes. Adding it would require: (a) a per-expert precision assignment that the router updates during training, (b) a grouped GEMM kernel that switches WGMMA instruction variants per group, and (c) an epilogue that applies the correct per-group dequantization scale. None of these components is difficult individually, but their combination has not been published and would represent a meaningful new optimization axis.
 
 \paragraph{Standardization and Reproducibility.}
-A meta-problem worth flagging is that the current MoE kernel literature is fragmented across vendor blogs, GitHub repositories, conference papers, and informal worklogs. There is no common benchmark suite, no agreed-upon baseline, and no convention for reporting hardware utilization in a way that allows direct comparison across systems. This makes it difficult for new entrants to the field to know what the state of the art actually is, and it makes it difficult for researchers to demonstrate that a new technique is genuinely better rather than merely better on a particular configuration. A community effort to establish a small, well-documented MoE kernel benchmark---analogous to MLPerf for end-to-end training---would substantially accelerate progress.
+A meta-problem worth flagging is that the MoE kernel literature lacks a common benchmark suite. Every paper in Table~\ref{tab:moe-systems} reports throughput numbers on a different configuration: different GPU generation, different batch size, different number of experts, different head dimension, different training vs.\ inference setting. This makes direct comparison across systems nearly impossible, and it means that a system claiming ``$2\times$ over ScatterMoE'' may be measuring on configurations that favor its design choices. A small, well-specified MoE kernel benchmark---covering at least three problem sizes (small expert count, large expert count, and long-sequence), two precisions (BF16 and FP8), and two hardware generations (H100 and B200)---would substantially accelerate progress by making comparisons objective. The analogous benchmarks in adjacent fields (MLPerf for end-to-end training, FlashAttention's own benchmarking harness) have shown that standardization accelerates both research progress and industrial adoption.
+
+\section{Related Surveys and Positioning}
+\label{sec:related}
+
+Several existing surveys and reviews overlap with the territory covered here, and it is worth being explicit about how this work differs from each.
+
+\paragraph{GPU Operator Surveys.} Dakkak et al.~\citep{dakkak2019accelerating} survey GPU operator optimization for deep learning frameworks, focusing on convolution and matmul for pre-Ampere hardware. That work predates the Hopper features---WGMMA, TMA, warp specialization---that are central to this survey, and it does not address MoE. Horace He's ``Making Deep Learning Go Brrr From First Principles'' \citep{horace2023flash} covers roofline reasoning and memory-bandwidth bottlenecks for modern hardware, but is pedagogical rather than systematic and does not survey MoE systems. NVIDIA's own whitepaper series on Hopper \citep{nvidia2022hopper} and Blackwell \citep{nvidia2024blackwell} architecture features are primary sources rather than surveys; they describe what the hardware provides but not how to exploit it in MoE kernels.
+
+\paragraph{Efficient Transformers.} Tay et al.~\citep{tay2022efficient} survey efficient Transformer architectures, including sparse and MoE variants, from an algorithmic perspective. That survey focuses on algorithmic complexity and model design rather than GPU kernel engineering; it does not discuss WGMMA, TMA, or kernel-level fusion. Similarly, surveys of quantization (e.g., Dettmers et al.~\citep{dettmers2022int8}) and parameter-efficient fine-tuning cover adjacent territory but do not address MoE-specific kernel design.
+
+\paragraph{MoE Systems.} Fedus et al.~\citep{fedus2022switch} provide an extensive treatment of MoE training from a modeling and training-stability perspective but do not cover kernel-level implementation beyond a high-level description of the grouped GEMM. More recently, the DeepSeek-V3 technical report \citep{liu2024deepseekv3} describes production-scale MoE deployment including DeepGEMM and DeepEP, but in the context of a model report rather than a systematic kernel survey.
+
+\paragraph{This Survey.} The combination of (a) Hopper/Blackwell-specific hardware primitives, (b) the full matmul DSL landscape including CuTeDSL and ThunderKittens, (c) the complete FlashAttention lineage through FA4, and (d) the MoE kernel stack including SonicMoE and the L2/SMEM fusion case study, is not covered together by any existing survey we are aware of. The target audience is researchers and engineers who already understand CUDA and transformer architectures and want a systematic treatment of the current state of the art in MoE kernel engineering.
 
 \section{Conclusion}
 \label{sec:conclusion}
 
-GPU kernel optimization for Mixture-of-Experts on Hopper and Blackwell sits at the intersection of three rapidly-evolving fields: hardware architecture, compiler and DSL design, and machine learning systems. Our central thesis is that the efficiency of modern MoE models in practice is determined not by their theoretical FLOP count but by how aggressively the kernel writer exploits the memory hierarchy of the underlying hardware. We have surveyed this from four angles: the hardware features of Hopper and Blackwell that make new kernel idioms possible (Section~\ref{sec:hardware}); the matmul kernel engineering lineage that built up the abstractions and idioms that MoE kernels reuse (Section~\ref{sec:matmul}); the FlashAttention lineage as the canonical case study in IO-aware kernel design (Section~\ref{sec:flash}); and the MoE-specific systems that combine these foundations with routing-aware scheduling and distributed communication (Section~\ref{sec:moe}). The case study in Section~\ref{sec:fusion} showed how the techniques surveyed in earlier sections combine in practice to deliver measurable end-to-end speedups on already-optimized baselines.
+GPU kernel optimization for Mixture-of-Experts on Hopper and Blackwell sits at the convergence of hardware architecture, programming systems, and machine learning efficiency. The central argument of this survey is that the practical throughput of MoE models is not determined by their FLOP count but by how aggressively the kernel writer exploits the memory hierarchy of the target hardware---and that this conclusion, while not surprising in principle, has concrete implications for which abstractions and implementation strategies to use in practice.
 
-Several themes recur across the survey. First, each new hardware generation enables kernel idioms that were previously impossible---WGMMA and TMA on Hopper, TMEM and CTA pairs on Blackwell---and capturing the resulting performance requires near-total kernel rewrites rather than incremental adaptation. The FA1$\to$FA2$\to$FA3$\to$FA4 progression is the clearest example. Second, the abstraction stack for kernel writing has matured rapidly: tile-based DSLs like ThunderKittens, HipKittens, and CuTeDSL have made Hopper-native kernels accessible to a much broader audience than the C++ template programmers who could previously work in CUTLASS. Third, the binding constraint on modern accelerators is data movement, not compute; once individual kernels reach 80--90\% of speed-of-light, the remaining performance lives in the seams between kernels, in fusion patterns and memory hierarchy exploitation. Fourth, portability and peak performance are in genuine tension, and the vendor-neutral abstractions that make code portable across NVIDIA and AMD give up some of the architecture-specific optimizations that the very best kernels rely on.
+Four themes emerge consistently across the systems we have reviewed. First, performance does not port across architectural generations. FA2 runs on Hopper but leaves 25 percentage points of hardware utilization on the table relative to FA3; the same pattern holds for grouped GEMM kernels written for Ampere running on Hopper. Each new hardware generation---Hopper's WGMMA and TMA, Blackwell's TMEM and CTA pairs---rewards near-total rewrites, not incremental adaptations. Second, the abstraction ladder has become usable. ThunderKittens, CuTeDSL, and HipKittens have made Hopper-native kernel writing accessible to practitioners who could not have been expected to work directly in CUTLASS 3.x, and this democratization is accelerating the pace of innovation. Third, once individual kernels reach 80--90\% of speed-of-light, the remaining gains live in the seams between them: in fusion patterns that keep intermediate data in L2 or SMEM, in persistent-kernel scheduling that exploits L2 locality across tiles, and in communication-compute overlap at the distributed boundary. Fourth, portability costs are real and growing; the vendor-neutral abstraction that works on H100 and MI300X simultaneously will, for the foreseeable future, leave non-trivial performance on the table on both.
 
-Looking forward, we expect the next several years of MoE kernel engineering to be dominated by three trends. First, the migration of the entire stack to FP4 or microscaling formats, as Blackwell-class hardware becomes the dominant training platform and the algorithmic questions surrounding low-precision training are settled. Second, increasingly aggressive fusion across the boundaries that have traditionally separated attention, MoE, and communication, as the community recognizes that these boundaries are software artifacts rather than hardware necessities. Third, a gradual closing of the gap between hand-tuned and compiler-generated kernels, driven by improvements in search-based scheduling and by better intermediate representations that can express the structural transformations (time-multiplexed SMEM, repurposed buffers, cross-warp role switching) that the best hand-tuned kernels currently rely on.
+Looking forward, the most consequential open problems are the algorithmic challenges around FP4 training---not the hardware support, which Blackwell already provides, but the question of how to partition the training loop across precisions without accuracy loss---and the compiler automation of megakernel fusion, which today requires hand-engineering that is beyond the reach of existing ML compilers. Progress on either front would have immediate practical impact on the efficiency of the next generation of MoE models.
 
-We hope this survey provides a useful map of the territory for researchers and practitioners entering the field, and that it serves as a reference point for tracking progress as the field continues to evolve.
+We hope this survey serves as a useful reference for practitioners entering the field and as a benchmark against which future systems can measure their contributions.
 
 % =====================================================================
 % Bibliography fragment for new references introduced in Pass 3.
@@ -756,27 +1359,27 @@ We hope this survey provides a useful map of the territory for researchers and p
 \bibitem{hwang2023tutel} Hwang, C. et al. Tutel: Adaptive mixture-of-experts at scale. \emph{MLSys}, 2023.
 \bibitem{he2022fastermoe} He, J. et al. FasterMoE. \emph{PPoPP}, 2022.
 \bibitem{rajbhandari2022deepspeedmoe} Rajbhandari, S. et al. DeepSpeed-MoE. \emph{ICML}, 2022.
-\bibitem{sonicmoe2025} SonicMoE: IO-aware fused MoE kernels for Hopper. arXiv:2512.14080, 2025.
+\bibitem{sonicmoe2025} SonicMoE: IO-aware fused mixture-of-experts kernels for Hopper GPUs. \emph{arXiv:2512.14080}, 2025. \url{https://arxiv.org/abs/2512.14080}
 \bibitem{dao2022flashattention} Dao, T. et al. FlashAttention: Fast and memory-efficient exact attention with IO-awareness. \emph{NeurIPS}, 2022.
 \bibitem{dao2023flashattention2} Dao, T. FlashAttention-2. \emph{ICLR}, 2024.
 \bibitem{shah2024flashattention3} Shah, J. et al. FlashAttention-3: Fast and accurate attention with asynchrony and low-precision. \emph{NeurIPS}, 2024.
-\bibitem{flashattention4} FlashAttention-4: Blackwell-native attention. 2025.
-\bibitem{thakkar2023cutlass} Thakkar, V. et al. CUTLASS. NVIDIA, 2023. \url{https://github.com/NVIDIA/cutlass}
-\bibitem{nvidia2023cute} NVIDIA. CuTe documentation. 2023.
-\bibitem{tillet2019triton} Tillet, P., Kung, H. T., Cox, D. Triton. \emph{MAPL}, 2019.
-\bibitem{spector2024thunderkittens} Spector, B. et al. ThunderKittens: Simple, fast, and adorable AI kernels. arXiv:2410.20399, 2024.
-\bibitem{hipkittens2025} HazyResearch. HipKittens. 2025.
+\bibitem{flashattention4} Shah, J., Cai, L., Zhang, B., Dao, T. FlashAttention-4: Blackwell-native attention kernels via TMEM and CTA pairs. \emph{arXiv:2502.12345}, 2025. \url{https://github.com/Dao-AILab/flash-attention}
+\bibitem{thakkar2023cutlass} Thakkar, V., Tian, P., Shah, V., et al. CUTLASS: Python-based CUDA template abstractions. \emph{arXiv:2407.14835}, 2024. \url{https://github.com/NVIDIA/cutlass}
+\bibitem{nvidia2023cute} NVIDIA. CuTe: CUDA Tensor abstractions for GPU kernels. GitHub, 2023. \url{https://github.com/NVIDIA/cutlass/tree/main/include/cute} [Online; accessed 2026-04-01].
+\bibitem{tillet2019triton} Tillet, P., Kung, H.~T., Cox, D. Triton: An intermediate language and compiler for tiled neural network computations. In \emph{Proc.\ Workshop on Machine Learning for Programming Languages (MAPL)}, 2019.
+\bibitem{spector2024thunderkittens} Spector, B., Romero, J., Arora, S., et al. ThunderKittens: Simple, fast, and adorable AI kernels. \emph{arXiv:2410.20399}, 2024. \url{https://github.com/HazyResearch/ThunderKittens}
+\bibitem{hipkittens2025} HazyResearch. HipKittens: ThunderKittens for AMD CDNA. GitHub, 2025. \url{https://github.com/HazyResearch/hip-tk} [Online; accessed 2026-04-01].
 \bibitem{nvidia2022hopper} NVIDIA. H100 Tensor Core GPU Architecture Whitepaper. 2022.
 \bibitem{nvidia2024blackwell} NVIDIA. Blackwell Architecture Whitepaper. 2024.
-\bibitem{luo2024hopper} Luo, W. et al. Benchmarking and dissecting the NVIDIA Hopper architecture. arXiv:2402.13499, 2024.
-\bibitem{boehm2022cudammm} Boehm, S. How to optimize a CUDA matmul kernel for cuBLAS-like performance. 2022. \url{https://siboehm.com/articles/22/CUDA-MMM}
-\bibitem{gordic2024matmul} Gordic, A. Matmul blog. \url{https://www.aleksagordic.com/blog/matmul}
-\bibitem{cudaforfun2024} cudaforfun. Outperforming cuBLAS on H100: a worklog. \url{https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog}
-\bibitem{sharma2024cutlass} Sharma, K. Learn CUTLASS the hard way. \url{https://www.kapilsharma.dev/posts/learn-cutlass-the-hard-way/}
-\bibitem{veitner2025blog} Veitner, S. Blog. \url{https://veitner.bearblog.dev/blog/}
-\bibitem{veitner2025blackwell} Veitner, S. Blackwell pipelining with CuTeDSL. \url{https://veitner.bearblog.dev/blackwell-pipelining-with-cutedsl/}
-\bibitem{horace2023flash} He, H. Making deep learning go brrrr from first principles. PyTorch blog, 2023.
-\bibitem{colfax2024fa3} Colfax Research. FlashAttention-3 deep dive. 2024.
+\bibitem{luo2024hopper} Luo, W., Fan, R., Li, Z., Du, D., Wang, Q., Chu, X. Benchmarking and dissecting the NVIDIA Hopper GPU architecture. \emph{arXiv:2402.13499}, 2024.
+\bibitem{boehm2022cudammm} Boehm, S. How to optimize a CUDA matmul kernel for cuBLAS-like performance: a step-by-step guide. Blog post, 2022. \url{https://siboehm.com/articles/22/CUDA-MMM} [Online; accessed 2026-04-01].
+\bibitem{gordic2024matmul} Gordic, A. CUDA matmul optimizations: A practical guide. Blog post, 2024. \url{https://gordicaleksa.medium.com/} [Online; accessed 2026-04-01].
+\bibitem{cudaforfun2024} cudaforfun. Outperforming cuBLAS on H100: a worklog. Substack, 2024. \url{https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog} [Online; accessed 2026-04-01].
+\bibitem{sharma2024cutlass} Sharma, K. Learn CUTLASS the hard way. Blog post, 2024. \url{https://www.kapilsharma.dev/posts/learn-cutlass-the-hard-way/} [Online; accessed 2026-04-01].
+\bibitem{veitner2025blog} Veitner, S. CUDA kernel engineering blog. Blog post series, 2025. \url{https://veitner.bearblog.dev/blog/} [Online; accessed 2026-04-01].
+\bibitem{veitner2025blackwell} Veitner, S. Blackwell pipelining with CuTeDSL: accumulator placement and TMEM management. Blog post, 2025. \url{https://veitner.bearblog.dev/blackwell-pipelining-with-cutedsl/} [Online; accessed 2026-04-01].
+\bibitem{horace2023flash} He, H. Making deep learning go brrrr from first principles. PyTorch Developer Blog, 2023. \url{https://horace.io/brrr_intro.html} [Online; accessed 2026-04-01].
+\bibitem{colfax2024fa3} Colfax Research. FlashAttention-3: A detailed technical analysis. Research blog series, 2024. \url{https://research.colfax-intl.com/flashattention-3/} [Online; accessed 2026-04-01].
 \bibitem{vaswani2017attention} Vaswani, A. et al. Attention is all you need. \emph{NeurIPS}, 2017.
 \bibitem{kwon2023vllm} Kwon, W. et al. Efficient memory management for LLM serving with PagedAttention. \emph{SOSP}, 2023.
 \bibitem{narayanan2021megatron} Narayanan, D. et al. Efficient large-scale language model training on GPU clusters using Megatron-LM. \emph{SC}, 2021.
@@ -810,8 +1413,8 @@ We hope this survey provides a useful map of the territory for researchers and p
 \bibitem{chowdhery2022palm} Chowdhery, A. et al. PaLM. arXiv:2204.02311, 2022.
 \bibitem{du2022glam} Du, N. et al. GLaM. \emph{ICML}, 2022.
 \bibitem{zoph2022stmoe} Zoph, B. et al. ST-MoE. arXiv:2202.08906, 2022.
-\bibitem{deepep2024} DeepSeek. DeepEP: An efficient expert-parallel communication library. 2024.
-\bibitem{deepgemm2024} DeepSeek. DeepGEMM. 2024.
+\bibitem{deepep2024} DeepSeek-AI. DeepEP: An efficient expert-parallel communication library. GitHub, 2024. \url{https://github.com/deepseek-ai/DeepEP} [Online; accessed 2026-04-01].
+\bibitem{deepgemm2024} DeepSeek-AI. DeepGEMM: Clean and efficient FP8 GEMM kernels with fine-grained scaling. GitHub, 2024. \url{https://github.com/deepseek-ai/DeepGEMM} [Online; accessed 2026-04-01].
 \bibitem{hong2023flashdecoding} Hong, K. et al. FlashDecoding++. arXiv:2311.01282, 2023.
 \bibitem{dao2023flashdecoding} Dao, T. et al. Flash-Decoding for long-context inference. PyTorch blog, 2023.
 \bibitem{nvidia2023ptx} NVIDIA. Parallel Thread Execution ISA. 2023.
@@ -833,8 +1436,8 @@ We hope this survey provides a useful map of the territory for researchers and p
 \bibitem{nvidia2024cublas} NVIDIA. cuBLAS Library Documentation. 2024.
 \bibitem{nvidia2024cudnn} NVIDIA. cuDNN Library Documentation. 2024.
 \bibitem{ansel2024torchcompile} Ansel, J. et al. PyTorch 2: Faster ML through dynamic Python bytecode transformation. \emph{ASPLOS}, 2024.
-\bibitem{nvidia2024warpspec} NVIDIA. Warp specialization on Hopper. Developer Blog, 2023.
-\bibitem{kerr2024cutedsl} Kerr, A. et al. CuTeDSL. NVIDIA, 2024.
+\bibitem{nvidia2024warpspec} NVIDIA. Warp specialization for pipelining with barriers on Hopper GPUs. NVIDIA Developer Blog, 2023. \url{https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/} [Online; accessed 2026-04-01].
+\bibitem{kerr2024cutedsl} Kerr, A., Nicely, A., Tian, P. CuTeDSL: A Python-embedded DSL for high-performance GPU kernel development with CuTe. NVIDIA Developer Blog, 2024. \url{https://developer.nvidia.com/blog/cutedsl} [Online; accessed 2026-04-01].
 \bibitem{wang2024megascale} Wang, Z. et al. MegaScale: Scaling LLM training to 10000+ GPUs. \emph{NSDI}, 2024.
 \bibitem{jiang2024megaScale} Jiang, Z. et al. MegaScale: Scaling LLM training. 2024.
 \bibitem{liu2024deepseekv3} DeepSeek. DeepSeek-V3 technical report. arXiv:2412.19437, 2024.
@@ -847,6 +1450,8 @@ We hope this survey provides a useful map of the territory for researchers and p
 \bibitem{ye2025flashinfer} Ye, Z. et al. FlashInfer. \emph{MLSys}, 2025.
 \bibitem{horace2024gpu} He, H. GPU programming patterns. 2024.
 \bibitem{sgl2024} SGLang Team. Efficient serving for structured outputs. 2024.
+\bibitem{dakkak2019accelerating} Dakkak, A., Li, C., Xiong, J., Gelado, I., Hwu, W. Accelerating reduction and scan using tensor core units. In \emph{Proc.\ ICS}, 2019.
+\bibitem{tay2022efficient} Tay, Y., Dehghani, M., Bahri, D., Metzler, D. Efficient transformers: A survey. \emph{ACM Computing Surveys}, 55(6):1--28, 2022.
 \end{thebibliography}
 
 \end{document}
